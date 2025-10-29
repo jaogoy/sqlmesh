@@ -125,6 +125,7 @@ snowflake = [
     "snowflake-connector-python[pandas,secure-local-storage]",
     "snowflake-snowpark-python",
 ]
+starrocks = ["pymysql"]
 trino = ["trino"]
 web = [
     "fastapi==0.115.5",
@@ -273,6 +274,7 @@ markers = [
     "trino: test for Trino (all connectors)",
     "risingwave: test for Risingwave",
     "doris: test for Doris",
+    "starrocks: test for StarRocks",
 
     # Other
     "set_default_connection",
