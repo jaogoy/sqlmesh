@@ -7,6 +7,17 @@ without any manual parameter construction.
 
 import sys
 from pathlib import Path
+import logging
+
+# Configure logging to see SQL statements
+# Set root logger to INFO
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s - %(message)s'
+)
+
+# Specifically enable SQL execution logging for the engine adapter module
+logging.getLogger('sqlmesh.core.engine_adapter.base').setLevel(logging.INFO)
 
 # Add paths
 base_dir = Path(__file__).parent.parent.parent.parent
@@ -64,13 +75,23 @@ def main():
     from sqlmesh.core.engine_adapter.starrocks import StarRocksEngineAdapter
 
     original_create_from_columns = StarRocksEngineAdapter._create_table_from_columns
+    original_init = StarRocksEngineAdapter.__init__
+
+    def patched_init(self, *args, **kwargs):
+        """Patch __init__ to set execute_log_level to INFO"""
+        # Force execute_log_level to INFO
+        kwargs['execute_log_level'] = logging.INFO
+        original_init(self, *args, **kwargs)
+
+    # Monkey patch __init__
+    StarRocksEngineAdapter.__init__ = patched_init
 
     def debug_create_table_from_columns(self, *args, **kwargs):
         """Intercept and print all parameters"""
         print("\n" + "=" * 100)
         print("  _create_table_from_columns() called with following parameters:")
         print("=" * 100)
-        
+
         # Process positional args
         if args:
             print(f"\n{'─' * 100}")
@@ -78,7 +99,7 @@ def main():
             print(f"{'─' * 100}")
             for i, arg in enumerate(args):
                 print(f"\n  args[{i}]: {type(arg).__name__}")
-        
+
         # Process keyword args
         for param_name in sorted(kwargs.keys()):
             print(f"\n{'─' * 100}")
@@ -86,11 +107,11 @@ def main():
             print(f"{'─' * 100}")
             param_value = kwargs[param_name]
             print(format_expression(param_value))
-        
+
         print("\n" + "=" * 100)
         print("  End of parameters")
         print("=" * 100)
-        
+
         # Call original method
         return original_create_from_columns(self, *args, **kwargs)
 
@@ -102,6 +123,14 @@ def main():
     print(f"\nLoading context from: {test_dir}")
 
     context = Context(paths=[str(test_dir)])
+
+    # Enable SQL logging on the adapter
+    if hasattr(context, '_engine_adapter') and context._engine_adapter:
+        context._engine_adapter = context._engine_adapter.with_settings(
+            execute_log_level=logging.INFO
+        )
+        print("\n✓ SQL logging enabled on adapter")
+
     print(f"\n✓ Context loaded with {len(context.models)} model(s)")
 
     # List models
@@ -122,14 +151,14 @@ def main():
         print(f"\n✗ Error during plan: {e!r}")
         print("  (This is expected if StarRocks is not actually running)")
         print("  The important part is the parameter dumps above")
-        
+
         # Print detailed traceback
         import traceback
         print("\n" + "="*100)
         print("  Detailed Traceback:")
         print("="*100)
         traceback.print_exc()
-        
+
         # Print exception details
         print("\n" + "="*100)
         print("  Exception Details:")

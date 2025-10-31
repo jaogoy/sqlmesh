@@ -103,8 +103,25 @@ class StarRocksEngineAdapter(
     MAX_COLUMN_COMMENT_LENGTH = 255
     """Maximum length for column comments"""
 
-    SUPPORTS_INDEXES = True
-    """StarRocks supports secondary indexes (bloom filter, bitmap, etc.)"""
+    SUPPORTS_INDEXES = False
+    """
+    StarRocks does NOT support standalone CREATE INDEX statements.
+
+    Indexes in StarRocks must be defined during table creation using:
+    - PRIMARY KEY: Automatically creates sorted index (already used for state tables)
+    - INDEX clause: For bloom filter, bitmap, inverted indexes in CREATE TABLE
+
+    Example:
+        CREATE TABLE t (
+            id INT,
+            name STRING,
+            INDEX idx_name (name) USING BITMAP
+        ) PRIMARY KEY (id);
+
+    Since SQLMesh state tables use PRIMARY KEY for the columns that would need
+    indexes, and PRIMARY KEY provides efficient lookups, we set this to False
+    to prevent CREATE INDEX statements that would fail.
+    """
 
     SUPPORTS_REPLACE_TABLE = False
     """No REPLACE TABLE syntax; use DROP + CREATE instead"""
