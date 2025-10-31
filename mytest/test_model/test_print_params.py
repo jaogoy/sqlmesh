@@ -4,6 +4,14 @@ Direct test - manually trigger create_table to print parameters
 
 import sys
 from pathlib import Path
+import argparse
+import logging
+
+# Configure logging to see SQL statements
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s - %(name)s - %(message)s'
+)
 
 # Add paths
 base_dir = Path(__file__).parent.parent.parent.parent
@@ -12,6 +20,35 @@ sys.path.insert(0, str(base_dir / 'sqlmesh'))
 
 from sqlmesh import Context
 from sqlglot import exp
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description='Print model parameters passed to StarRocksEngineAdapter'
+    )
+    parser.add_argument(
+        '--model',
+        '-m',
+        type=str,
+        help='Model to test: comprehensive, complex_part, range_part, unknown_func, or full model name'
+    )
+    return parser.parse_args()
+
+
+def get_model_name(short_name: str) -> str:
+    """Convert short name to full model name"""
+    model_map = {
+        'comprehensive': '"mytest"."starrocks_comprehensive"',
+        'complex_part': '"mytest"."starrocks_complex_partition"',
+        'range_part': '"mytest"."test_range_partition"',
+        'unknown_func': '"mytest"."test_unknown_func"',
+    }
+    # If it's a short name, convert it
+    if short_name in model_map:
+        return model_map[short_name]
+    # Otherwise return as-is (assume it's a full model name)
+    return short_name
 
 
 def format_param(value, indent=0):
@@ -48,17 +85,40 @@ def format_param(value, indent=0):
 
 
 def main():
+    args = parse_args()
+    
     print("=" * 100)
     print("  Direct Parameter Print Test")
     print("=" * 100)
 
     test_dir = Path(__file__).parent
     context = Context(paths=[str(test_dir)])
-
+    
+    # Enable SQL logging by setting adapter's execute_log_level to INFO
+    if hasattr(context, '_engine_adapter') and context._engine_adapter:
+        context._engine_adapter = context._engine_adapter.with_settings(
+            execute_log_level=logging.INFO
+        )
+    
     print(f"\n✓ Loaded {len(context.models)} models\n")
 
+    # Filter models if specific model requested
+    if args.model:
+        full_model_name = get_model_name(args.model)
+        if full_model_name in context.models:
+            models_to_test = {full_model_name: context.models[full_model_name]}
+            print(f"Testing model: {args.model} -> {full_model_name}\n")
+        else:
+            print(f"✗ Model '{full_model_name}' not found!")
+            print(f"Available models: {list(context.models.keys())}")
+            print(f"\nShort names: comprehensive, complex_part, range_part, unknown_func")
+            return
+    else:
+        models_to_test = context.models
+        print(f"Testing all {len(models_to_test)} models\n")
+
     # Test each model
-    for model_name, model in context.models.items():
+    for model_name, model in models_to_test.items():
         print("\n" + "=" * 100)
         print(f"  Model: {model_name}")
         print("=" * 100)

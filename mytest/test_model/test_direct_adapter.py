@@ -65,25 +65,34 @@ def main():
 
     original_create_from_columns = StarRocksEngineAdapter._create_table_from_columns
 
-    def debug_create_table_from_columns(self, **kwargs):
+    def debug_create_table_from_columns(self, *args, **kwargs):
         """Intercept and print all parameters"""
         print("\n" + "=" * 100)
         print("  _create_table_from_columns() called with following parameters:")
         print("=" * 100)
-
+        
+        # Process positional args
+        if args:
+            print(f"\n{'─' * 100}")
+            print("Positional arguments:")
+            print(f"{'─' * 100}")
+            for i, arg in enumerate(args):
+                print(f"\n  args[{i}]: {type(arg).__name__}")
+        
+        # Process keyword args
         for param_name in sorted(kwargs.keys()):
             print(f"\n{'─' * 100}")
             print(f"Parameter: {param_name}")
             print(f"{'─' * 100}")
             param_value = kwargs[param_name]
             print(format_expression(param_value))
-
+        
         print("\n" + "=" * 100)
         print("  End of parameters")
         print("=" * 100)
-
+        
         # Call original method
-        return original_create_from_columns(self, **kwargs)
+        return original_create_from_columns(self, *args, **kwargs)
 
     # Monkey patch
     StarRocksEngineAdapter._create_table_from_columns = debug_create_table_from_columns
@@ -110,9 +119,25 @@ def main():
         plan = context.plan(auto_apply=False, no_prompts=True)
         print("\n✓ Plan created (parameters should have been printed above)")
     except Exception as e:
-        print(f"\n✗ Error during plan: {e}")
+        print(f"\n✗ Error during plan: {e!r}")
         print("  (This is expected if StarRocks is not actually running)")
         print("  The important part is the parameter dumps above")
+        
+        # Print detailed traceback
+        import traceback
+        print("\n" + "="*100)
+        print("  Detailed Traceback:")
+        print("="*100)
+        traceback.print_exc()
+        
+        # Print exception details
+        print("\n" + "="*100)
+        print("  Exception Details:")
+        print("="*100)
+        print(f"  Type: {type(e).__name__}")
+        print(f"  Args: {e.args}")
+        if hasattr(e, '__dict__'):
+            print(f"  Attributes: {e.__dict__}")
 
 
 if __name__ == "__main__":

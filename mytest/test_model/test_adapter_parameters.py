@@ -11,6 +11,14 @@ This demonstrates the full flow:
 import sys
 from pathlib import Path
 from unittest.mock import patch
+import argparse
+import logging
+
+# Configure logging to see SQL statements
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s - %(name)s - %(message)s'
+)
 
 # Add paths
 base_dir = Path(__file__).parent.parent.parent.parent
@@ -19,6 +27,33 @@ sys.path.insert(0, str(base_dir / 'sqlmesh'))
 
 from sqlmesh import Context
 from sqlglot import exp
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description='Test model properties → engine adapter parameter flow'
+    )
+    parser.add_argument(
+        '--model',
+        '-m',
+        type=str,
+        help='Model to test: comprehensive, complex_part, range_part, unknown_func, or full model name'
+    )
+    return parser.parse_args()
+
+
+def get_model_name(short_name: str) -> str:
+    """Convert short name to full model name"""
+    model_map = {
+        'comprehensive': '"mytest"."starrocks_comprehensive"',
+        'complex_part': '"mytest"."starrocks_complex_partition"',
+        'range_part': '"mytest"."test_range_partition"',
+        'unknown_func': '"mytest"."test_unknown_func"',
+    }
+    if short_name in model_map:
+        return model_map[short_name]
+    return short_name
 
 
 def print_section(title):
@@ -59,6 +94,8 @@ def format_value(value, indent=0):
 
 
 def main():
+    args = parse_args()
+    
     print_section("SQLMesh Model → Engine Adapter Parameter Flow")
 
     # Setup
@@ -68,10 +105,29 @@ def main():
     # Create context
     print("\n1. Loading SQLMesh Context...")
     context = Context(paths=[str(mytest_dir)])
+    
+    # Enable SQL logging
+    if hasattr(context, '_engine_adapter') and context._engine_adapter:
+        context._engine_adapter = context._engine_adapter.with_settings(
+            execute_log_level=logging.INFO
+        )
+    
     print(f"   ✓ Context loaded with {len(context.models)} model(s)")
 
     # Get model
-    model_name = list(context.models.keys())[0]
+    if args.model:
+        full_model_name = get_model_name(args.model)
+        if full_model_name in context.models:
+            model_name = full_model_name
+            print(f"   Testing: {args.model} -> {model_name}")
+        else:
+            print(f"   ✗ Model '{full_model_name}' not found!")
+            print(f"   Available: {list(context.models.keys())}")
+            return
+    else:
+        model_name = list(context.models.keys())[0]
+        print(f"   Testing: {model_name} (first model, use -m to specify)")
+    
     model = context.models[model_name]
 
     print_section("STEP 1: Model Definition Properties")

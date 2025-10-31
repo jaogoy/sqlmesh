@@ -9,6 +9,14 @@ This test shows:
 
 import sys
 from pathlib import Path
+import argparse
+import logging
+
+# Configure logging to see SQL statements
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s - %(name)s - %(message)s'
+)
 
 # Add paths for sqlglot and sqlmesh
 base_dir = Path(__file__).parent.parent.parent.parent
@@ -24,7 +32,36 @@ except ImportError as e:
     sys.exit(1)
 
 
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description='SQLMesh Model Property Parsing Test'
+    )
+    parser.add_argument(
+        '--model',
+        '-m',
+        type=str,
+        help='Model to test: comprehensive, complex_part, range_part, unknown_func, or full model name'
+    )
+    return parser.parse_args()
+
+
+def get_model_name(short_name: str) -> str:
+    """Convert short name to full model name"""
+    model_map = {
+        'comprehensive': '"mytest"."starrocks_comprehensive"',
+        'complex_part': '"mytest"."starrocks_complex_partition"',
+        'range_part': '"mytest"."test_range_partition"',
+        'unknown_func': '"mytest"."test_unknown_func"',
+    }
+    if short_name in model_map:
+        return model_map[short_name]
+    return short_name
+
+
 def main():
+    args = parse_args()
+    
     print("=" * 80)
     print("  SQLMesh Model Property Parsing Test")
     print("=" * 80)
@@ -37,6 +74,13 @@ def main():
     print("\n1. Creating SQLMesh Context...")
     try:
         context = Context(paths=[str(mytest_dir)])
+        
+        # Enable SQL logging
+        if hasattr(context, '_engine_adapter') and context._engine_adapter:
+            context._engine_adapter = context._engine_adapter.with_settings(
+                execute_log_level=logging.INFO
+            )
+        
         print(f"   ✓ Context created")
         print(f"   - Default dialect: {context.config.dialect}")
         print(f"   - Models found: {len(context.models)}")
@@ -45,8 +89,13 @@ def main():
         return
 
     # Find our model
-    model_name = '"mytest"."starrocks_comprehensive"'
-    print(f"\n2. Loading model: {model_name}")
+    if args.model:
+        model_name = get_model_name(args.model)
+        print(f"\n2. Loading model: {args.model} -> {model_name}")
+    else:
+        model_name = '"mytest"."starrocks_comprehensive"'
+        print(f"\n2. Loading model: {model_name} (default)")
+        print(f"   Tip: Use -m comprehensive, complex_part, range_part, or unknown_func")
 
     if model_name not in context.models:
         print(f"   ✗ Model not found!")

@@ -19,7 +19,7 @@ MODEL (
       'PARTITION p202402 VALUES LESS THAN ("2024-03-01")',
       'PARTITION p202403 VALUES LESS THAN ("2024-04-01")'
     ),
-    replication_num = '3',
+    replication_num = '1',
     storage_medium = 'SSD',
     enable_persistent_index = 'true',
     compression = 'LZ4'

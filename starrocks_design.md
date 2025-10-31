@@ -1768,77 +1768,787 @@ DELETE FROM sales WHERE customer_id IN (SELECT id FROM blacklist);
 
 ## 7. StarRocks Adapter 实现方案
 
-### 7.1 继承策略
+### 7.1 继承策略分析
+
+**重要决策：StarRocks 应该独立实现，而非继承 Doris**
+
+根据对代码库的深入分析，发现当前 StarRocksEngineAdapter 采用的是**独立实现 + 参考 Doris 模式复用**策略，而非直接继承。这是正确的设计选择，原因如下：
+
+#### 7.1.1 为什么不继承 Doris？
+
+1. **PRIMARY KEY vs UNIQUE KEY 的本质差异**
+   - StarRocks：原生支持 `PRIMARY KEY`，直接调用基类实现
+   - Doris：必须将 `primary_key` 转换为 `unique_key` in table_properties
+   - 如果继承 Doris，需要跳过父类的转换逻辑，违反里氏替换原则
+
+2. **继承链的复杂性**
+   ```python
+   # 如果继承 Doris，在 _create_table_from_columns 中需要：
+   class StarRocksEngineAdapter(DorisEngineAdapter):
+       def _create_table_from_columns(self, ...):
+           # 不能调用 super()，因为会触发 Doris 的 unique_key 转换
+           # 必须跳过一级，直接调用 EngineAdapter
+           EngineAdapter._create_table_from_columns(self, ...)
+   ```
+   这种跨级调用破坏了继承的封装性，容易在未来版本中引入 bug。
+
+3. **代码可维护性**
+   - 独立实现：清晰表达 StarRocks 的特性
+   - 继承 Doris：需要理解 Doris 的转换逻辑才能正确重载
+   - 当 Doris 内部实现变更时，StarRocks 可能受到意外影响
+
+4. **Mixin 继承的灵活性**
+   ```python
+   # 当前实现（推荐）
+   class StarRocksEngineAdapter(
+       LogicalMergeMixin,  # 提供 merge 逻辑
+       PandasNativeFetchDFSupportMixin,  # DataFrame 支持
+       NonTransactionalTruncateMixin,  # TRUNCATE 支持
+   ):
+       # 直接继承自 EngineAdapter（通过 Mixin）
+       # 可以选择性继承需要的功能
+   ```
+
+#### 7.1.2 推荐的实现策略
+
+**代码复用通过「参考」而非「继承」**：
 
 ```python
-from sqlmesh.core.engine_adapter.doris import DorisEngineAdapter
+from sqlmesh.core.engine_adapter.base import EngineAdapter
+from sqlmesh.core.engine_adapter.mixins import (
+    LogicalMergeMixin,
+    NonTransactionalTruncateMixin,
+    PandasNativeFetchDFSupportMixin,
+)
 
-class StarRocksEngineAdapter(DorisEngineAdapter):
+class StarRocksEngineAdapter(
+    LogicalMergeMixin,
+    PandasNativeFetchDFSupportMixin,
+    NonTransactionalTruncateMixin,
+):
     """
     StarRocks Engine Adapter
 
-    StarRocks 与 Doris 高度相似，因此继承 DorisEngineAdapter
-    并只重载差异部分。
+    StarRocks 与 Doris 高度相似，但在关键特性上有本质差异：
+    - StarRocks 原生支持 PRIMARY KEY
+    - Doris 使用 UNIQUE KEY 模拟主键
+
+    因此采用独立实现，参考 Doris 的成功模式，而非直接继承。
     """
     DIALECT = "starrocks"
-    # 其他属性复用 Doris 的配置
+    # 声明式配置（与 Doris 相同）
+    SUPPORTS_TRANSACTIONS = False
+    INSERT_OVERWRITE_STRATEGY = InsertOverwriteStrategy.DELETE_INSERT
+    # ...
 ```
 
 **优势**：
-1. **最大化代码复用**：90% 的功能直接继承
-2. **减少维护成本**：Doris Adapter 的 bug 修复和优化自动继承
-3. **保持一致性**：两个 Adapter 的行为高度一致
+1. **清晰的语义**：代码明确表达 StarRocks 的特性
+2. **减少耦合**：不依赖 Doris 的内部实现细节
+3. **灵活性**：可以自由选择重载哪些方法
+4. **可维护性**：Doris 的变更不会影响 StarRocks
+5. **代码复用**：通过 Mixin 和参考 Doris 实现来复用逻辑
 
-### 7.2 需要重载的方法列表
+### 7.2 StarRocksEngineAdapter 重要方法实现指南
 
-根据上述分析，需要重载的方法（**按优先级排序**）：
+本节详细说明 StarRocksEngineAdapter 中需要实现的重要方法，包括功能说明、注意事项和实现要点。
 
-#### 7.2.1 高优先级（必须重载）
+#### 7.2.1 核心表操作方法
 
-**1. _create_table_from_columns()**
+##### **create_schema() / drop_schema()**
 
-- **原因**：StarRocks 使用 `PRIMARY KEY` 而非 `UNIQUE KEY`
-- **实现**：
+**功能**：创建和删除数据库（StarRocks 中 SCHEMA = DATABASE）
 
+**是否需要重载**：不需要
+
+**原因**：
+- StarRocks 与 MySQL 一样使用 `DATABASE` 关键字
+- 基类的 `_create_schema(kind="DATABASE")` 已经满足需求
+- 直接复用基类实现即可
+
+**注意事项**：
+- StarRocks 不支持 `CASCADE` 选项用于删除数据库
+- 使用前确保数据库中没有表
+
+```python
+# 不需要重载，基类实现已经支持
+# 调用方式：
+adapter.create_schema("my_db", ignore_if_exists=True)
+adapter.drop_schema("my_db", cascade=False)  # cascade 无效
+```
+
+---
+
+##### **_create_table_from_columns()**
+
+**功能**：根据列定义创建表
+
+**是否需要重载**：**是（核心差异）**
+
+**StarRocks vs Doris 差异**：
+- **StarRocks**: 原生支持 `PRIMARY KEY(col1, col2)`
+- **Doris**: 使用 `UNIQUE KEY(col1, col2)` 模拟主键
+
+**实现要点**：
 ```python
 def _create_table_from_columns(
     self,
     table_name: TableName,
-    column_definitions: dict,
+    target_columns_to_types: t.Dict[str, exp.DataType],
     primary_key: t.Optional[t.Tuple[str, ...]] = None,
-    **kwargs
+    exists: bool = True,
+    table_description: t.Optional[str] = None,
+    column_descriptions: t.Optional[t.Dict[str, str]] = None,
+    **kwargs: t.Any,
 ) -> None:
-    # StarRocks 支持标准的 PRIMARY KEY，直接调用爷类（EngineAdapter）
-    # 跳过 DorisEngineAdapter 的 unique_key 转换
-    EngineAdapter._create_table_from_columns(
-        self,
+    """
+    StarRocks 原生支持 PRIMARY KEY，直接调用基类实现。
+    不需要像 Doris 那样转换为 UNIQUE KEY。
+    """
+    # 直接调用基类，primary_key 会被正确处理
+    super()._create_table_from_columns(
         table_name=table_name,
-        column_definitions=column_definitions,
-        primary_key=primary_key,
-        **kwargs
+        target_columns_to_types=target_columns_to_types,
+        primary_key=primary_key,  # 直接传递，不转换
+        exists=exists,
+        table_description=table_description,
+        column_descriptions=column_descriptions,
+        **kwargs,
     )
 ```
 
-**注意**：不要调用 `super()._create_table_from_columns()`，因为那会调用 DorisEngineAdapter 的版本（会转换为 unique_key）。应该直接调用 EngineAdapter 的版本。
+**生成的 SQL**：
+```sql
+CREATE TABLE IF NOT EXISTS db.sales (
+    id INT,
+    amount DECIMAL(18,2),
+    dt DATE
+)
+PRIMARY KEY(id)  -- 不是 UNIQUE KEY
+PARTITION BY RANGE(dt) ()
+DISTRIBUTED BY HASH(id) BUCKETS 10;
+```
 
-#### 7.2.2 中优先级（根据测试结果决定）
+**注意事项**：
+- 如果继承 Doris，此方法必须跳过父类的 `unique_key` 转换逻辑
+- 如果独立实现，直接调用基类即可
+- 确保 `primary_key` 列必须在 DISTRIBUTED BY 的列中（StarRocks 要求）
 
-**2. _create_materialized_view()**
+---
 
-- **原因**：物化视图的 REFRESH 策略可能有差异
-- **实现**：需要先测试 StarRocks 的语法，然后决定是否重载
+##### **_get_data_objects()**
 
-**3. delete_from()**
+**功能**：查询指定 schema 中的所有表和视图
 
-- **原因**：需要测试 StarRocks 是否支持子查询删除
-- **实现**：如果不支持，复用 Doris 的实现
+**是否需要重载**：可能不需要
 
-#### 7.2.3 低优先级（可选）
+**原因**：
+- StarRocks 实现了 MySQL 兼容的 `information_schema` 系统表
+- Doris 的实现应该直接适用
 
-**4. _build_table_properties_exp()**
+**Doris 实现参考**：
+```python
+def _get_data_objects(
+    self, schema_name: SchemaName, object_names: t.Optional[t.Set[str]] = None
+) -> t.List[DataObject]:
+    query = (
+        exp.select(
+            exp.column("table_schema").as_("schema_name"),
+            exp.column("table_name").as_("name"),
+            exp.case()
+            .when(exp.column("table_type").eq("BASE TABLE"), exp.Literal.string("table"))
+            .when(exp.column("table_type").eq("VIEW"), exp.Literal.string("view"))
+            .else_("table_type")
+            .as_("type"),
+        )
+        .from_(exp.table_("tables", db="information_schema"))
+        .where(exp.column("table_schema").eq(to_schema(schema_name).db))
+    )
+    if object_names:
+        lowered_names = [name.lower() for name in object_names]
+        query = query.where(exp.func("LOWER", exp.column("table_name")).isin(*lowered_names))
 
-- **原因**：如果表属性语法有细微差异（如 PROPERTIES 的格式）
-- **实现**：先测试 Doris 的实现是否兼容，再决定是否重载
+    return [
+        DataObject(schema=row[0], name=row[1], type=DataObjectType.from_str(row[2]))
+        for row in self.fetchall(query)
+    ]
+```
+
+**测试建议**：
+1. 测试查询空数据库
+2. 测试查询包含表和视图的数据库
+3. 测试使用 `object_names` 过滤
+4. 测试表名大小写敏感性
+
+---
+
+##### **columns()**
+
+**功能**：获取表的列定义（列名和数据类型）
+
+**是否需要重载**：不需要
+
+**原因**：
+- 基类使用 `DESCRIBE TABLE` 语句
+- StarRocks 完全支持此语法
+
+**基类实现**：
+```python
+def columns(self, table_name: TableName) -> t.Dict[str, exp.DataType]:
+    self.execute(exp.Describe(this=exp.to_table(table_name), kind="TABLE"))
+    describe_output = self.cursor.fetchall()
+    return {
+        column_name: exp.DataType.build(column_type, dialect=self.dialect)
+        for column_name, column_type, *_ in describe_output
+        if column_name and column_type
+    }
+```
+
+**注意事项**：
+- StarRocks 的数据类型需要与 SQLGlot 的 DataType 映射
+- 确保 StarRocks dialect 正确解析所有数据类型
+
+---
+
+#### 7.2.2 视图操作方法
+
+##### **create_view()**
+
+**功能**：创建普通视图或物化视图
+
+**是否需要重载**：**可能需要（取决于物化视图语法差异）**
+
+**Doris 实现逻辑**：
+```python
+def create_view(
+    self,
+    view_name: TableName,
+    query_or_df: QueryOrDF,
+    materialized: bool = False,
+    materialized_properties: t.Optional[t.Dict[str, t.Any]] = None,
+    **kwargs
+) -> None:
+    if replace:
+        self.drop_view(view_name, ignore_if_not_exists=True, materialized=materialized)
+
+    if not materialized:
+        # 普通视图：调用基类
+        return super().create_view(view_name, query_or_df, replace=False, **kwargs)
+
+    # 物化视图：调用专门方法
+    self._create_materialized_view(
+        view_name, query_or_df, materialized_properties=materialized_properties, **kwargs
+    )
+```
+
+**需要验证的 StarRocks 物化视图语法**：
+
+1. **BUILD 属性**
+   ```sql
+   -- Doris
+   CREATE MATERIALIZED VIEW mv BUILD IMMEDIATE AS SELECT ...;
+
+   -- StarRocks 是否支持？
+   BUILD IMMEDIATE | BUILD DEFERRED
+   ```
+
+2. **REFRESH 策略**
+   ```sql
+   -- Doris
+   REFRESH AUTO | MANUAL
+
+   -- StarRocks 可能的差异
+   REFRESH ASYNC | MANUAL | INCREMENTAL
+   REFRESH SCHEDULE INTERVAL n HOUR/DAY
+   ```
+
+3. **分区刷新**
+   ```sql
+   -- StarRocks 特有的分区刷新
+   PARTITION BY dt
+   REFRESH ASYNC START('2024-01-01') EVERY(INTERVAL 1 DAY)
+   ```
+
+**实现建议**：
+1. 先测试 Doris 的 `_create_materialized_view()` 是否兼容
+2. 如果语法相同，直接复用
+3. 如果有差异，重载此方法，重点处理 `materialized_properties` 的解析
+
+**注意事项**：
+- StarRocks 物化视图可能不支持 `REPLACE`，需要先 `DROP` 再 `CREATE`
+- 物化视图的分区和分布属性可能与表有细微差异
+- 确保 `REFRESH` 策略的关键字正确映射
+
+---
+
+##### **drop_view()**
+
+**功能**：删除视图或物化视图
+
+**是否需要重载**：可能不需要
+
+**基类实现**：
+```python
+def drop_view(
+    self,
+    view_name: TableName,
+    ignore_if_not_exists: bool = True,
+    materialized: bool = False,
+    **kwargs
+) -> None:
+    self._drop_object(
+        name=view_name,
+        exists=ignore_if_not_exists,
+        kind="VIEW",
+        materialized=materialized and self.SUPPORTS_MATERIALIZED_VIEWS,
+        **kwargs,
+    )
+```
+
+**生成的 SQL**：
+```sql
+-- 普通视图
+DROP VIEW IF EXISTS my_view;
+
+-- 物化视图
+DROP MATERIALIZED VIEW IF EXISTS my_mv;
+```
+
+**注意事项**：
+- Doris 的同步物化视图（SYNC MV）需要特殊的删除语法：`DROP MATERIALIZED VIEW mv_name ON table_name`
+- 确认 StarRocks 是否有类似的特殊情况
+
+---
+
+#### 7.2.3 数据操作方法
+
+##### **insert_append()**
+
+**功能**：向表追加数据
+
+**是否需要重载**：不需要
+
+**基类实现**：
+```python
+def insert_append(
+    self,
+    table_name: TableName,
+    query_or_df: QueryOrDF,
+    target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+    **kwargs
+) -> None:
+    source_queries, target_columns_to_types = self._get_source_queries_and_columns_to_types(
+        query_or_df, target_columns_to_types, target_table=table_name
+    )
+    for source_query in source_queries:
+        with source_query as query:
+            self.execute(exp.insert(query, table_name, columns=list(target_columns_to_types)))
+```
+
+**生成的 SQL**：
+```sql
+INSERT INTO db.table (col1, col2, col3)
+SELECT col1, col2, col3 FROM source_table;
+```
+
+**注意事项**：
+- StarRocks 支持标准的 `INSERT INTO ... SELECT` 语法
+- 直接复用基类实现
+
+---
+
+##### **insert_overwrite_by_time_partition()**
+
+**功能**：按时间分区覆盖写入数据（核心回填方法）
+
+**是否需要重载**：不需要
+
+**原因**：
+- 已声明 `INSERT_OVERWRITE_STRATEGY = DELETE_INSERT`
+- 基类自动选择 DELETE + INSERT 执行路径
+
+**执行流程**：
+```python
+# 用户调用
+adapter.insert_overwrite_by_time_partition(
+    table_name="db.sales",
+    query_or_df=Select(...),
+    start="2024-01-01",
+    end="2024-01-02",
+    time_column="dt"
+)
+
+# 基类内部执行
+# 1. 构建时间过滤条件
+where_condition = (dt >= '2024-01-01') AND (dt < '2024-01-02')
+
+# 2. 调用 _insert_overwrite_by_condition
+#    -> 检测到 INSERT_OVERWRITE_STRATEGY = DELETE_INSERT
+#    -> 执行 delete_from(where=where_condition)
+#    -> 执行 insert_append(query)
+```
+
+**生成的 SQL**：
+```sql
+-- 步骤 1：删除旧数据
+DELETE FROM db.sales
+WHERE dt >= '2024-01-01' AND dt < '2024-01-02';
+
+-- 步骤 2：插入新数据
+INSERT INTO db.sales (id, amount, dt)
+SELECT id, amount, dt FROM source_table
+WHERE dt >= '2024-01-01' AND dt < '2024-01-02';
+```
+
+**注意事项**：
+- 两步操作不是原子性的，依赖分区级别锁保证一致性
+- 如果 StarRocks 未来支持 `INSERT OVERWRITE`，可以修改策略配置
+- 确保 `time_column` 在表的分区列中
+
+---
+
+##### **delete_from()**
+
+**功能**：从表中删除数据
+
+**是否需要重载**：**可能需要（取决于子查询支持）**
+
+**关键测试**：StarRocks 是否支持 `DELETE ... WHERE ... IN (SELECT ...)`
+
+```sql
+-- 测试这个语句能否执行
+DELETE FROM sales
+WHERE customer_id IN (SELECT id FROM blacklist);
+```
+
+**如果支持**：不需要重载，使用基类实现
+
+**如果不支持**：复用 Doris 的实现，转换为 `DELETE ... USING` 语法
+
+**Doris 的转换逻辑**：
+```python
+def delete_from(
+    self, table_name: TableName, where: t.Optional[t.Union[str, exp.Expression]] = None
+) -> None:
+    if not where:
+        # 优化：无条件删除 -> TRUNCATE
+        self.execute(f"TRUNCATE TABLE {table_name}")
+        return
+
+    # 检查是否包含子查询
+    subquery_expr = self._find_subquery_in_condition(where)
+    if subquery_expr:
+        # 转换为 DELETE ... USING
+        self._execute_delete_with_subquery(table_name, subquery_expr)
+    else:
+        # 标准 DELETE 语法
+        super().delete_from(table_name, where)
+```
+
+**转换示例**：
+```sql
+-- 原始语句（不支持）
+DELETE FROM sales WHERE customer_id IN (SELECT id FROM blacklist);
+
+-- 转换后（支持）
+DELETE FROM sales AS t1
+USING blacklist AS t2
+WHERE t1.customer_id = t2.id;
+```
+
+**实现建议**：
+1. 先测试 StarRocks 对子查询删除的支持
+2. 如果支持，使用基类实现
+3. 如果不支持，参考 Doris 实现 `_find_subquery_in_condition()` 和 `_execute_delete_with_subquery()`
+
+---
+
+#### 7.2.4 表属性构建方法
+
+##### **_build_table_properties_exp()**
+
+**功能**：构建表属性表达式（PARTITION BY, DISTRIBUTED BY 等）
+
+**是否需要重载**：**可能需要（取决于属性语法差异）**
+
+**关键属性**：
+
+1. **PRIMARY KEY / UNIQUE KEY**
+   ```python
+   # StarRocks
+   exp.PrimaryKey(expressions=[exp.to_column(k) for k in primary_key])
+
+   # Doris
+   exp.UniqueKeyProperty(expressions=[exp.to_column(k) for k in unique_key])
+   ```
+
+2. **PARTITION BY**
+   ```python
+   # RANGE 分区
+   exp.PartitionByRangeProperty(
+       partition_expressions=[exp.Column("dt")],
+       create_expressions=[...],  # 分区定义
+   )
+
+   # LIST 分区
+   exp.PartitionByListProperty(
+       partition_expressions=[exp.Column("region")],
+       create_expressions=[...],
+   )
+   ```
+
+3. **DISTRIBUTED BY**
+   ```python
+   # HASH 分布
+   exp.DistributedByProperty(
+       kind="HASH",
+       expressions=[exp.Column("id")],
+       buckets=exp.Literal.number(10)
+   )
+
+   # RANDOM 分布
+   exp.DistributedByProperty(kind="RANDOM")
+   ```
+
+4. **PROPERTIES (系统属性)**
+   ```python
+   exp.Properties(
+       expressions=[
+           exp.Property(this="replication_num", value=exp.Literal.string("3")),
+           exp.Property(this="storage_medium", value=exp.Literal.string("SSD")),
+       ]
+   )
+   ```
+
+**Doris 实现参考**：
+```python
+def _build_table_properties_exp(
+    self,
+    partitioned_by: t.Optional[t.List[exp.Expression]] = None,
+    table_properties: t.Optional[t.Dict[str, t.Any]] = None,
+    table_description: t.Optional[str] = None,
+    table_kind: t.Optional[str] = None,
+    **kwargs
+) -> t.Optional[exp.Properties]:
+    properties_list = []
+
+    # 1. 处理 UNIQUE KEY (Doris) / PRIMARY KEY (StarRocks)
+    if "unique_key" in table_properties:
+        properties_list.append(
+            exp.UniqueKeyProperty(expressions=table_properties["unique_key"])
+        )
+
+    # 2. 处理 PARTITION BY
+    if partitioned_by:
+        properties_list.append(
+            self._build_partitioned_by_exp(partitioned_by, **kwargs)
+        )
+
+    # 3. 处理 DISTRIBUTED BY
+    if "distributed_by" in table_properties:
+        dist = table_properties["distributed_by"]
+        properties_list.append(
+            exp.DistributedByProperty(
+                kind=dist["kind"],
+                expressions=dist["columns"],
+                buckets=exp.Literal.number(dist["buckets"])
+            )
+        )
+
+    # 4. 处理 COMMENT
+    if table_description:
+        properties_list.append(
+            exp.SchemaCommentProperty(
+                this=exp.Literal.string(table_description)
+            )
+        )
+
+    return exp.Properties(expressions=properties_list) if properties_list else None
+```
+
+**StarRocks 需要注意的差异**：
+
+1. **PRIMARY KEY 的位置**
+   - 基类会在列定义中生成 `PRIMARY KEY`
+   - 不需要在 `_build_table_properties_exp` 中处理
+
+2. **分区类型**
+   - RANGE 分区：与 Doris 相同
+   - LIST 分区：需要测试语法
+   - 表达式分区：`PARTITION BY (col1, col2)` 是否支持？
+
+3. **DISTRIBUTED BY 语法**
+   ```sql
+   -- 测试这些语法是否都支持
+   DISTRIBUTED BY HASH(col1) BUCKETS 10
+   DISTRIBUTED BY HASH(col1, col2) BUCKETS 10
+   DISTRIBUTED BY RANDOM
+   ```
+
+**实现建议**：
+1. 先测试 Doris 的实现是否兼容
+2. 如果兼容，直接复用（去掉 `unique_key` 处理）
+3. 如果有差异，重载此方法，重点处理分区和分布语法
+
+---
+
+##### **_build_partitioned_by_exp()**
+
+**功能**：构建分区表达式
+
+**是否需要重载**：**可能需要**
+
+**Doris 实现要点**：
+```python
+def _build_partitioned_by_exp(
+    self,
+    partitioned_by: t.List[exp.Expression],
+    partition_interval_unit: t.Optional[IntervalUnit] = None,
+    **kwargs
+) -> t.Optional[exp.PartitionedByProperty]:
+    # 解析分区类型：RANGE / LIST
+    partitioned_by, partition_kind = self._parse_partition_expressions(partitioned_by)
+
+    # 获取分区定义
+    partitions = kwargs.get("partitions")  # 如 "PARTITION p20240101 VALUES [(...), (...))"
+
+    if partition_kind == "LIST":
+        return exp.PartitionByListProperty(
+            partition_expressions=partitioned_by,
+            create_expressions=partitions
+        )
+    else:  # RANGE
+        return exp.PartitionByRangeProperty(
+            partition_expressions=partitioned_by,
+            create_expressions=partitions
+        )
+```
+
+**StarRocks 分区类型**：
+
+1. **RANGE 分区**
+   ```sql
+   PARTITION BY RANGE(dt) (
+       PARTITION p20240101 VALUES [("2024-01-01"), ("2024-01-02")),
+       PARTITION p20240102 VALUES [("2024-01-02"), ("2024-01-03"))
+   )
+   ```
+
+2. **LIST 分区**（需要测试）
+   ```sql
+   PARTITION BY LIST(region) (
+       PARTITION p_cn VALUES IN ("Beijing", "Shanghai"),
+       PARTITION p_us VALUES IN ("New York", "Los Angeles")
+   )
+   ```
+
+3. **表达式分区**（StarRocks 特有？）
+   ```sql
+   PARTITION BY (date_trunc('day', dt))
+   ```
+
+**实现建议**：
+1. 测试 StarRocks 支持哪些分区类型
+2. 如果只支持 RANGE，可以简化 Doris 的实现
+3. 如果支持表达式分区，需要扩展解析逻辑
+
+---
+
+#### 7.2.5 其他重要方法
+
+##### **create_table_like()**
+
+**功能**：基于已有表创建新表（复制结构）
+
+**是否需要重载**：不需要
+
+**基类实现**：
+```python
+def create_table_like(
+    self,
+    target_table_name: TableName,
+    source_table_name: TableName,
+    exists: bool = True,
+    **kwargs
+) -> None:
+    self.execute(
+        exp.Create(
+            this=exp.to_table(target_table_name),
+            kind="TABLE",
+            exists=exists,
+            properties=exp.Properties(
+                expressions=[exp.LikeProperty(this=exp.to_table(source_table_name))]
+            ),
+        )
+    )
+```
+
+**生成的 SQL**：
+```sql
+CREATE TABLE IF NOT EXISTS new_table LIKE old_table;
+```
+
+**注意事项**：
+- StarRocks 应该支持标准的 `CREATE TABLE ... LIKE` 语法
+- 测试时确认分区、分布等属性是否也被复制
+
+---
+
+##### **_create_table_comment() / _build_create_comment_column_exp()**
+
+**功能**：添加或修改表和列的注释
+
+**是否需要重载**：可能不需要
+
+**Doris 实现**：
+```python
+def _create_table_comment(self, table_name: TableName, table_comment: str) -> None:
+    table_sql = exp.to_table(table_name).sql(dialect=self.dialect, identify=True)
+    self.execute(
+        f'ALTER TABLE {table_sql} MODIFY COMMENT "{self._truncate_table_comment(table_comment)}"'
+    )
+
+def _build_create_comment_column_exp(
+    self, table: exp.Table, column_name: str, column_comment: str
+) -> str:
+    table_sql = table.sql(dialect=self.dialect, identify=True)
+    return f'ALTER TABLE {table_sql} MODIFY COLUMN {column_name} COMMENT "{self._truncate_column_comment(column_comment)}"'
+```
+
+**生成的 SQL**：
+```sql
+-- 修改表注释
+ALTER TABLE db.sales MODIFY COMMENT "销售事实表";
+
+-- 修改列注释
+ALTER TABLE db.sales MODIFY COLUMN id COMMENT "销售ID";
+```
+
+**注意事项**：
+- 测试 StarRocks 是否支持相同的语法
+- StarRocks 可能支持在 CREATE TABLE 时直接指定注释
+- 注意 `MAX_TABLE_COMMENT_LENGTH` 和 `MAX_COLUMN_COMMENT_LENGTH` 的限制
+
+---
+
+### 7.2.6 方法实现优先级总结
+
+| 优先级 | 方法 | 是否重载 | 原因 |
+|--------|------|----------|------|
+| **高** | `_create_table_from_columns()` | **是** | PRIMARY KEY vs UNIQUE KEY 核心差异 |
+| **中** | `create_view()` / `_create_materialized_view()` | 可能 | 需测试物化视图语法差异 |
+| **中** | `delete_from()` | 可能 | 需测试子查询删除支持 |
+| **中** | `_build_table_properties_exp()` | 可能 | 需测试分区/分布语法差异 |
+| **低** | `_build_partitioned_by_exp()` | 可能 | 需测试分区类型支持 |
+| **低** | `_create_table_comment()` | 可能不需要 | 测试 Doris 实现是否兼容 |
+| **无** | `create_schema()` / `drop_schema()` | 否 | 基类已支持 |
+| **无** | `_get_data_objects()` | 否 | information_schema 兼容 |
+| **无** | `columns()` | 否 | DESCRIBE TABLE 兼容 |
+| **无** | `insert_append()` | 否 | 标准 INSERT 语法 |
+| **无** | `insert_overwrite_by_time_partition()` | 否 | DELETE_INSERT 策略自动处理 |
+| **无** | `create_table_like()` | 否 | 标准 LIKE 语法 |
+
+---
 
 ### 7.3 实现步骤
 
@@ -3074,5 +3784,703 @@ mysql -h 127.0.0.1 -P 9030 -u root
 4. **实施路径**：分 5 个阶段逐步实现，从核心功能到全面测试，预计 2-3 周完成
 
 5. **测试保障**：单元测试 + 集成测试 + E2E 测试，确保功能的正确性和稳定性
+
+通过遵循本文档的指导，可以高质量地完成 StarRocks Engine Adapter 的开发，为 SQLMesh 生态系统增加一个重要的数据库支持。
+
+---
+
+## 附录 A: SQLMesh/SQLGlot 核心设计要点
+
+### A.1 Expression 中的 `this` 属性设计哲学
+
+**核心原则**: `this` 始终代表表达式的**主体**（primary subject）
+
+#### A.1.1 已知函数（Known Functions）
+
+对于 SQLGlot 已注册的函数类，`this` 指向**被操作的对象**：
+
+```python
+# 示例：TimestampTrunc
+DATE_TRUNC('DAY', event_date)
+↓
+TimestampTrunc(
+    this=Column('event_date'),  # 主体：被截断的列
+    unit=Var('DAY')              # 其他参数：存储在 args 中
+)
+
+# 为什么这样设计？
+# 1. SQLGlot 知道这个函数的语义
+# 2. 第一个参数是主要操作对象
+# 3. 可以进行类型检查和优化
+```
+
+访问方式：
+```python
+trunc_expr.this              # Column 对象
+trunc_expr.this.this         # Identifier 对象  
+trunc_expr.this.this.this    # 字符串 'event_date'
+```
+
+#### A.1.2 未知函数（Anonymous Functions）
+
+对于 SQLGlot 未注册的函数，`this` 存储**函数名字符串**：
+
+```python
+# 示例：RANGE (SQLGlot 不认识)
+RANGE(dt)
+↓
+Anonymous(
+    this='RANGE',               # 主体：函数名（字符串）
+    expressions=[Column('dt')]  # 参数列表
+)
+
+# 为什么存储字符串？
+# 1. SQLGlot 不知道这个函数的语义
+# 2. 需要保存函数名用于往返转换（round-trip）
+# 3. Anonymous('RANGE', [Column('dt')]) → .sql() → "RANGE(dt)"
+```
+
+#### A.1.3 其他 Expression 类型
+
+| Expression 类型 | this 的含义 | 示例 |
+|----------------|-------------|------|
+| **Column** | Identifier 对象 | `Column(this=Identifier('event_date'))` |
+| **EQ (二元操作)** | 左操作数 | `EQ(this=Column('kind'), expression=Literal('HASH'))` |
+| **Table** | 表名 Identifier | `Table(this=Identifier('sales'), db=Identifier('db'))` |
+| **Literal** | 字面值本身 | `Literal(this='HASH')`, `Literal(this=10)` |
+
+**设计哲学总结**：
+- 已知语法 → 结构化存储（类型安全，可优化）
+- 未知语法 → 字符串存储（灵活性，支持往返）
+
+### A.2 SQLMesh MODEL 属性解析规则
+
+#### A.2.1 解析策略差异
+
+SQLMesh 使用**上下文相关解析**（context-aware parsing）：
+
+```python
+# 在 dialect.py 的 _parse_model() 方法中
+
+if key == "partitioned_by":
+    # 特殊解析器 → 返回 List
+    partitioned_by = self._parse_partitioned_by()
+    if isinstance(partitioned_by.this, exp.Schema):
+        value = exp.tuple_(*partitioned_by.this.expressions)  # 提取 List
+else:
+    # 通用解析器 → 返回 Tuple/Column/Literal
+    value = self._parse_bracket(self._parse_field(any_token=True))
+```
+
+**为什么不同？**
+
+| 属性 | 解析器 | 返回类型 | 原因 |
+|------|--------|----------|------|
+| `partitioned_by` | `_parse_partitioned_by()` | `List[Expression]` | 分区列可能有多个，需要特殊处理表达式 |
+| `distributed_by` | `_parse_field()` | `Tuple[EQ, ...]` | 通用字段解析，保持原始结构 |
+| `columns` | `_parse_schema()` | `Dict[str, DataType]` | Schema 解析器，知道要提取数据类型 |
+
+#### A.2.2 distributed_by 的嵌套结构
+
+MODEL 定义：
+```sql
+distributed_by = (kind='HASH', expressions=customer_id, buckets=10)
+```
+
+解析结果：
+```python
+Tuple([
+    EQ(this=Column('kind'), expression=Literal('HASH')),
+    EQ(this=Column('expressions'), expression=Column('customer_id')),
+    EQ(this=Column('buckets'), expression=Literal(10))
+])
+```
+
+**Adapter 需要做的转换**：
+```python
+# 1. 遍历 Tuple 提取 EQ 表达式
+for eq in distributed_by_tuple.expressions:
+    key = eq.this.this  # 'kind', 'expressions', 'buckets'
+    value = eq.expression  # Literal('HASH'), Column(...), Literal(10)
+
+# 2. 构建 DistributedByProperty
+exp.DistributedByProperty(
+    kind=exp.Var(this='HASH'),
+    expressions=[exp.Column('customer_id')],
+    buckets=exp.Literal.number(10)
+)
+```
+
+### A.3 SQLGlot Generator 双重派发机制
+
+#### A.3.1 什么是双重派发？
+
+每个 Expression 类型必须有对应的 Generator 方法：
+
+```python
+# Expression 定义
+class DistributedByProperty(Property):
+    arg_types = {
+        "kind": False,
+        "expressions": False,
+        "buckets": False,
+        "order": False,
+    }
+
+# Generator 方法（必须存在）
+class StarRocks(MySQL):
+    class Generator(MySQL.Generator):
+        def distributedbyproperty_sql(self, expression: exp.DistributedByProperty) -> str:
+            kind = expression.args.get("kind")
+            # ...
+            return f"DISTRIBUTED BY {kind_sql} ({columns_sql}) BUCKETS {buckets_sql}"
+```
+
+**命名规则**：
+- Expression 类名：`DistributedByProperty`
+- Generator 方法：`distributedbyproperty_sql()` (全小写 + `_sql` 后缀)
+
+**触发流程**：
+```
+expression.sql(dialect='starrocks')
+    ↓
+StarRocks.Generator.sql(expression)
+    ↓
+查找方法名：type(expression).__name__.lower() + "_sql"
+    ↓
+调用 distributedbyproperty_sql(expression)
+    ↓
+返回 SQL 字符串
+```
+
+**如果方法不存在**：
+- SQLGlot 会回退到父类方法
+- 如果所有父类都没有 → 抛出异常或返回空字符串
+
+### A.4 Adapter 的两层 AST 转换
+
+这是理解 StarRocks Adapter 最重要的概念：
+
+```
+┌─────────────────────────────────────────────────┐
+│ Layer 1: SQLMesh MODEL Syntax AST              │
+│ (dialect.py 解析 MODEL(...) 语法)              │
+└─────────────────────────────────────────────────┘
+             ↓
+  包含嵌入的 SQLGlot Expression 对象
+      ├─ partitioned_by: List[exp.Expression]
+      ├─ distributed_by: exp.Tuple([exp.EQ, ...])
+      └─ properties: Dict[str, exp.Expression]
+             ↓
+┌─────────────────────────────────────────────────┐
+│ Model Object (Python)                           │
+│ 存储在 model.physical_properties 等属性中       │
+└─────────────────────────────────────────────────┘
+             ↓
+  传递给 EngineAdapter._build_table_properties_exp()
+             ↓
+┌─────────────────────────────────────────────────┐
+│ Layer 2: Dialect-Specific SQLGlot AST          │
+│ (Adapter 转换为 StarRocks 可识别的结构)        │
+└─────────────────────────────────────────────────┘
+  转换规则：
+      ├─ Anonymous('RANGE') → PartitionByRangeProperty
+      ├─ Tuple(EQ...) → DistributedByProperty
+      └─ Literal values → Properties(...)
+             ↓
+┌─────────────────────────────────────────────────┐
+│ exp.Create(                                     │
+│   properties=exp.Properties([                   │
+│     exp.DistributedByProperty(...),             │
+│     exp.PartitionByRangeProperty(...),          │
+│     ...                                         │
+│   ])                                            │
+│ )                                               │
+└─────────────────────────────────────────────────┘
+             ↓
+  StarRocks.Generator.sql()
+             ↓
+┌─────────────────────────────────────────────────┐
+│ Final SQL String                                │
+│ CREATE TABLE ... DISTRIBUTED BY ... PARTITION BY │
+└─────────────────────────────────────────────────┘
+```
+
+**为什么需要两层？**
+
+1. **Layer 1 (MODEL → Model Object)**:
+   - SQLMesh 的 MODEL 语法是自定义的
+   - 需要特殊解析器处理 MODEL(...) 块
+   - 但内部的表达式（如 `RANGE(dt)`）委托给 SQLGlot
+
+2. **Layer 2 (Model Object → SQL)**:
+   - 通用的 Expression (如 Tuple, Anonymous) 无法直接生成 SQL
+   - Adapter 需要理解语义，转换为方言特定的 Expression
+   - Generator 只认识方言特定的 Expression
+
+**关键职责划分**：
+
+| 层级 | 组件 | 职责 |
+|------|------|------|
+| **解析** | `dialect.py` | MODEL 语法 → Expression 树 |
+| **语义理解** | `StarRocksEngineAdapter` | Expression 树 → 方言特定 Expression |
+| **SQL 生成** | `StarRocks.Generator` | 方言特定 Expression → SQL 字符串 |
+
+### A.5 Properties 的扁平化 vs 嵌套模式
+
+#### A.5.1 为什么使用扁平化？
+
+Memory 中提到：
+> "Use flattened properties like distributed_by_kind and distributed_by_columns instead of complex expressions"
+
+原因：
+
+1. **解析问题**：SQLGlot 的 Parser 对某些嵌套结构支持不完善
+2. **单向限制**：SQLGlot 可以**生成** `DISTRIBUTED BY` SQL，但无法**解析**回来
+3. **显式控制**：扁平化格式让开发者显式控制每个属性
+
+#### A.5.2 当前实现方式
+
+MODEL 中使用嵌套表达式（推荐）：
+```sql
+distributed_by = (kind='HASH', expressions=id, buckets=10)
+```
+
+但避免直接传递字典（不推荐）：
+```python
+# ❌ 不推荐
+table_properties = {
+    "distributed_by": {
+        "kind": "HASH",
+        "expressions": ["id"],
+        "buckets": 10
+    }
+}
+
+# ✅ 推荐（当前实现）
+table_properties = {
+    "distributed_by": exp.Tuple([
+        exp.EQ(this=exp.Column("kind"), expression=exp.Literal.string("HASH")),
+        exp.EQ(this=exp.Column("expressions"), expression=exp.Column("id")),
+        exp.EQ(this=exp.Column("buckets"), expression=exp.Literal.number(10))
+    ])
+}
+```
+
+### A.6 partitioned_by 的字符串限制
+
+**问题**: 为什么不能用 `partitioned_by "RANGE(dt)"`？
+
+**答案**: SQLMesh 的 validator 会检查分区表达式：
+
+```python
+# 在 meta.py 的 _partition_and_cluster_validator 中
+for expression in expressions:
+    num_cols = len(list(expression.find_all(exp.Column)))
+    if num_cols == 0:
+        raise ConfigError(f"Field '{expression}' does not contain a column")
+```
+
+**为什么这样设计？**
+
+1. **语义验证**：确保分区表达式包含实际的列
+2. **依赖分析**：SQLMesh 需要知道分区依赖哪些列
+3. **类型安全**：字符串无法提供类型信息
+
+**影响**：
+- ✅ 可以：`partitioned_by RANGE(dt)` → `Anonymous('RANGE', [Column('dt')])`
+- ❌ 不可以：`partitioned_by "RANGE(dt)"` → `Literal("RANGE(dt)")` (无 Column)
+- ✅ 可以：`partitions = ("PARTITION p1 VALUES ...", ...)` → 分区定义可以是字符串
+
+**设计教训**: 分区**列**必须是表达式，分区**定义**可以是字符串
+
+---
+
+## 附录 B: Doris 特殊实现要点
+
+### B.1 PRIMARY KEY → UNIQUE KEY 转换
+
+这是 Doris Adapter 最重要的特殊处理：
+
+```python
+# 在 DorisEngineAdapter._create_table_from_columns() 中
+if primary_key:
+    # Doris 不支持 PRIMARY KEY，转换为 UNIQUE KEY
+    unique_key = primary_key
+    primary_key = None  # 清空，避免传递给基类
+```
+
+**为什么这样做？**
+
+1. SQLMesh 的通用 API 使用 `primary_key` 参数
+2. Doris 只支持 `UNIQUE KEY` 语法
+3. 在 Adapter 层做转换，对用户透明
+
+**StarRocks 的差异**：
+
+StarRocks 原生支持 `PRIMARY KEY`，因此**不需要**这个转换：
+
+```python
+# StarRocksEngineAdapter 不需要重载这部分
+# 直接让 primary_key 传递给基类即可
+```
+
+### B.2 Materialized View 的刷新策略
+
+Doris 的物化视图有特殊的刷新语法：
+
+```python
+def _create_materialized_view(
+    self,
+    view_name: TableName,
+    query: Query,
+    table_properties: t.Optional[t.Dict[str, t.Any]] = None,
+    **create_kwargs: t.Any,
+) -> None:
+    # 构建 BUILD IMMEDIATE/DEFERRED
+    build = table_properties.pop("build", "IMMEDIATE")
+    refresh_trigger = table_properties.pop("refresh_trigger", "MANUAL")
+    
+    # 生成 CREATE MATERIALIZED VIEW ... BUILD ... REFRESH ...
+```
+
+**关键配置**：
+- `build`: IMMEDIATE (立即构建) / DEFERRED (延迟构建)
+- `refresh_trigger`: MANUAL (手动) / SCHEDULE (定时) / COMMIT (事务触发)
+
+### B.3 分区表达式解析
+
+Doris Adapter 有复杂的分区表达式解析逻辑：
+
+```python
+def _parse_partition_expressions(
+    self, partitioned_by: t.List[exp.Expression]
+) -> t.Tuple[str, t.List[str]]:
+    """解析分区类型和分区列"""
+    
+    for expr in partitioned_by:
+        if isinstance(expr, exp.Anonymous):
+            # RANGE(col) 或 LIST(col)
+            kind = expr.this.upper()  # 'RANGE' 或 'LIST'
+            columns = [e.name for e in expr.expressions]
+            
+        elif isinstance(expr, exp.Literal) and expr.is_string:
+            # "RANGE(dt)" 字符串形式（向后兼容）
+            # 需要解析字符串提取类型和列名
+            
+    return kind, columns
+```
+
+**为什么需要处理字符串**？
+
+- 向后兼容旧代码
+- 某些复杂分区定义用字符串更方便
+- 但新代码推荐使用表达式
+
+### B.4 属性转换的通用模式
+
+Doris Adapter 中有一个通用的属性处理方法：
+
+```python
+def _properties_to_expressions(
+    self, properties: t.Dict[str, t.Any]
+) -> t.List[exp.Expression]:
+    """将字典属性转换为 exp.Property 列表"""
+    expressions = []
+    
+    for key, value in properties.items():
+        # 跳过特殊键
+        if key in {"distributed_by", "partitions", "unique_key", ...}:
+            continue
+            
+        # 转换值为 Expression
+        if not isinstance(value, exp.Expression):
+            value = exp.Literal.string(str(value))
+            
+        expressions.append(
+            exp.Property(this=exp.Literal.string(key), value=value)
+        )
+    
+    return expressions
+```
+
+**用途**：处理 `replication_num`, `storage_medium` 等通用属性
+
+### B.5 默认分布策略
+
+如果用户没有指定 `distributed_by`，Doris Adapter 会自动选择：
+
+```python
+# 如果没有 distributed_by，但有 unique_key
+if unique_key_property and not distributed_by:
+    # 使用 unique_key 的第一列作为分布列
+    first_col = unique_key_property.expressions[0]
+    properties.append(
+        exp.DistributedByProperty(
+            expressions=[first_col],
+            kind="HASH",
+            buckets=exp.Literal.number(10)  # 默认 10 个桶
+        )
+    )
+```
+
+**设计原理**：
+- 分布式表必须有分布列
+- Unique Key 的第一列通常是主键，适合作为分布列
+- 提供合理的默认值，降低用户配置负担
+
+---
+
+## 附录 C: 测试和调试技巧
+
+### C.1 启用 SQL 日志
+
+在测试文件中配置日志级别：
+
+```python
+import logging
+
+# 方式1: 配置全局日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s - %(name)s - %(message)s'
+)
+
+# 方式2: 创建 Adapter 时指定
+from sqlmesh.core.engine_adapter import create_engine_adapter
+
+adapter = create_engine_adapter(
+    connection_factory=connection_factory,
+    dialect="starrocks",
+    execute_log_level=logging.INFO  # 记录所有 SQL 执行
+)
+```
+
+**日志输出示例**：
+```
+INFO - sqlmesh.core.engine_adapter.base - Executing SQL:
+CREATE TABLE `my_db`.`fact_sales` (
+  `id` INT,
+  `amount` DECIMAL(18, 2)
+)
+DISTRIBUTED BY HASH (`id`) BUCKETS 10
+PROPERTIES ('replication_num'='3')
+```
+
+### C.2 表达式结构分析
+
+打印 Expression 的详细结构：
+
+```python
+def analyze_expression(expr, indent=0, show_all_args=False):
+    """递归分析 Expression 结构"""
+    prefix = "  " * indent
+    
+    if isinstance(expr, exp.Expression):
+        print(f"{prefix}{type(expr).__name__}")
+        
+        # 显示所有参数
+        if show_all_args and hasattr(expr, 'args'):
+            print(f"{prefix}  Available args: {list(expr.args.keys())}")
+        
+        # 显示 this
+        if hasattr(expr, 'this') and expr.this is not None:
+            print(f"{prefix}  this: {type(expr.this).__name__}")
+            if show_all_args and isinstance(expr.this, exp.Expression):
+                analyze_expression(expr.this, indent + 2, True)
+        
+        # 显示 expressions
+        if hasattr(expr, 'expressions') and expr.expressions:
+            print(f"{prefix}  expressions ({len(expr.expressions)} items)")
+            for i, sub in enumerate(expr.expressions):
+                print(f"{prefix}    [{i}]:")
+                analyze_expression(sub, indent + 3, show_all_args)
+```
+
+### C.3 快速测试单个 Model
+
+所有测试文件都支持 `-m` 参数：
+
+```bash
+# 使用短名称
+python test_print_params.py -m comprehensive
+python test_parse_model.py -m range_part
+python test_partition_parsing.py -m complex_part
+
+# 使用完整名称
+python test_print_params.py -m '"mytest"."starrocks_comprehensive"'
+```
+
+**短名称映射**：
+```python
+model_map = {
+    'comprehensive': '"mytest"."starrocks_comprehensive"',
+    'complex_part': '"mytest"."starrocks_complex_partition"',
+    'range_part': '"mytest"."test_range_partition"',
+    'unknown_func': '"mytest"."test_unknown_func"',
+}
+```
+
+### C.4 Monkey Patching 拦截方法
+
+在实际数据库不可用时，可以拦截方法：
+
+```python
+from sqlmesh.core.engine_adapter.base import EngineAdapter
+
+original_method = EngineAdapter._create_table_from_columns
+
+def intercept_create_table(self, *args, **kwargs):
+    print("\n=" * 50)
+    print("Intercepted _create_table_from_columns call")
+    for key, value in kwargs.items():
+        print(f"{key}: {type(value).__name__}")
+    print("=" * 50)
+    
+    # 不实际执行
+    return None
+
+EngineAdapter._create_table_from_columns = intercept_create_table
+```
+
+### C.5 验证生成的 SQL
+
+测试 Expression → SQL 转换：
+
+```python
+from sqlglot import exp
+
+# 构建 DistributedByProperty
+dist = exp.DistributedByProperty(
+    kind=exp.Var(this='HASH'),
+    expressions=[exp.Column('id')],
+    buckets=exp.Literal.number(10)
+)
+
+# 生成 SQL
+sql = dist.sql(dialect='starrocks')
+print(sql)  # DISTRIBUTED BY HASH (id) BUCKETS 10
+
+# 测试不同方言
+print(dist.sql(dialect='doris'))
+print(dist.sql(dialect='mysql'))  # 可能不支持
+```
+
+---
+
+## 附录 D: 常见陷阱和解决方案
+
+### D.1 Expression 构造时的参数传递
+
+**陷阱**: SQLGlot Expression 的 `__init__` 不接受位置参数
+
+```python
+# ❌ 错误
+dist = exp.DistributedByProperty(
+    exp.Var(this='HASH'),  # 位置参数
+    [exp.Column('id')],
+    exp.Literal.number(10)
+)
+# TypeError: Expression.__init__() takes 1 positional argument but 4 were given
+
+# ✅ 正确
+dist = exp.DistributedByProperty(
+    kind=exp.Var(this='HASH'),      # 关键字参数
+    expressions=[exp.Column('id')],
+    buckets=exp.Literal.number(10)
+)
+```
+
+### D.2 Identifier vs Column vs String
+
+**陷阱**: 混淆不同的表示方式
+
+```python
+# 三种表示列名的方式
+
+# 1. 字符串（最简单，但无类型信息）
+col_name = "customer_id"
+
+# 2. Identifier（标识符对象）
+identifier = exp.Identifier(this="customer_id")
+
+# 3. Column（列引用）
+column = exp.Column(this=exp.Identifier("customer_id"))
+# 或简写
+column = exp.to_column("customer_id")
+
+# 何时使用哪个？
+# - Table.this → Identifier
+# - Column.this → Identifier  
+# - SELECT 子句 → Column
+# - 函数参数 → Column
+```
+
+### D.3 Parser vs Generator 方法命名
+
+**陷阱**: 方法名大小写不一致
+
+```python
+# Parser 方法（解析 SQL → Expression）
+class StarRocks(MySQL):
+    class Parser(MySQL.Parser):
+        def _parse_distributed_by(self):  # 蛇形命名
+            # ...
+
+# Generator 方法（Expression → SQL）
+class StarRocks(MySQL):
+    class Generator(MySQL.Generator):
+        def distributedbyproperty_sql(self, expr):  # 全小写 + _sql
+            # ...
+```
+
+**规则**：
+- Parser: 蛇形命名 `_parse_xxx_yyy`
+- Generator: 全小写类名 + `_sql`
+
+### D.4 Properties 的嵌套层级
+
+**陷阱**: Properties 可能被错误地嵌套
+
+```python
+# ❌ 错误：嵌套了两层 Properties
+exp.Properties([
+    exp.Properties([  # 内层 Properties 是多余的
+        exp.Property(this="replication_num", value=exp.Literal(3))
+    ])
+])
+
+# ✅ 正确：只需一层 Properties
+exp.Properties([
+    exp.Property(this="replication_num", value=exp.Literal(3)),
+    exp.Property(this="storage_medium", value=exp.Literal.string("SSD"))
+])
+```
+
+**规则**：
+- `exp.Properties` 包含多个 `exp.Property`
+- 或包含特殊的 Property 子类（如 `DistributedByProperty`）
+- 但不要嵌套 `Properties`
+
+### D.5 MODEL 语法 vs Python API
+
+**陷阱**: MODEL 语法和 Python API 的差异
+
+```sql
+-- MODEL 语法（无等号）
+MODEL (
+  name mytest.sales,
+  partitioned_by (dt),
+  physical_properties (
+    distributed_by = (kind='HASH', expressions=id, buckets=10),  -- 有等号
+    replication_num = 3  -- 有等号
+  )
+)
+```
+
+**规则**：
+- **顶级属性**（name, kind, partitioned_by）：`key value` 无等号
+- **physical_properties 内部**：`key = value` 有等号
+- 原因：不同的解析规则（顶级用特殊 parser，内部用通用 field parser）
 
 通过遵循本文档的指导，可以高质量地完成 StarRocks Engine Adapter 的开发，为 SQLMesh 生态系统增加一个重要的数据库支持。

@@ -9,7 +9,8 @@ MODEL (
   dialect starrocks,
   partitioned_by (date_trunc('day', event_date), customer_id),
   physical_properties (
-    distributed_by = (kind='HASH', expressions=order_id, buckets=10)
+    distributed_by = (kind='HASH', expressions=order_id, buckets=10),
+    replication_num = 1
   ),
   columns (
     order_id INT,

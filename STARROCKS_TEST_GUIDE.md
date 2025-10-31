@@ -72,10 +72,10 @@ def test_create_schema(make_mocked_engine_adapter: t.Callable[..., StarRocksEngi
 def test_<method_name>(adapter: StarRocksEngineAdapter):
     """Test description."""
     # Arrange: Set up test data
-    
+
     # Act: Call adapter method
     adapter.some_method(args)
-    
+
     # Assert: Verify SQL generated
     assert to_sql_calls(adapter) == [
         "EXPECTED SQL STATEMENT 1",
@@ -140,7 +140,7 @@ def test_rename_table(adapter: StarRocksEngineAdapter):
 def test_create_view(adapter: StarRocksEngineAdapter):
     adapter.create_view("test_view", parse_one("SELECT a FROM tbl"))
     adapter.create_view("test_view", parse_one("SELECT a FROM tbl"), replace=False)
-    
+
     assert to_sql_calls(adapter) == [
         "DROP VIEW IF EXISTS `test_view`",
         "CREATE VIEW `test_view` AS SELECT `a` FROM `tbl`",
@@ -161,7 +161,7 @@ def test_delete_from(adapter: StarRocksEngineAdapter):
 
 ```python
 def test_with_mocked_methods(
-    adapter: StarRocksEngineAdapter, 
+    adapter: StarRocksEngineAdapter,
     mocker: MockerFixture
 ):
     # Mock specific method behavior
@@ -169,7 +169,7 @@ def test_with_mocked_methods(
         "a": exp.DataType.build("INT"),
         "b": exp.DataType.build("STRING"),
     })
-    
+
     # Test with mocked behavior
     result = adapter.some_method()
     # assertions...
@@ -294,8 +294,8 @@ tests/core/engine_adapter/integration/test_starrocks_integration.py
 ### Markers
 ```python
 pytestmark = [
-    pytest.mark.starrocks, 
-    pytest.mark.engine, 
+    pytest.mark.starrocks,
+    pytest.mark.engine,
     pytest.mark.docker  # or pytest.mark.remote
 ]
 ```
@@ -315,7 +315,7 @@ services:
       - "9030:9030"
     environment:
       - FE_SERVERS=fe1:172.26.92.140:9010
-      
+
   starrocks-be:
     image: starrocks/be-ubuntu:latest
     depends_on:
@@ -419,7 +419,7 @@ def adapter(make_mocked_engine_adapter) -> StarRocksEngineAdapter:
 def test_create_schema(adapter: StarRocksEngineAdapter):
     """Test CREATE DATABASE statement generation."""
     adapter.create_schema("test_schema")
-    
+
     assert to_sql_calls(adapter) == [
         "CREATE DATABASE IF NOT EXISTS `test_schema`",
     ]
@@ -435,7 +435,7 @@ def test_create_table_with_primary_key(adapter: StarRocksEngineAdapter):
         },
         primary_key=("id",),
     )
-    
+
     sql = to_sql_calls(adapter)[0]
     assert "CREATE TABLE IF NOT EXISTS `test_table`" in sql
     assert "PRIMARY KEY (`id`)" in sql
@@ -444,7 +444,7 @@ def test_create_table_with_primary_key(adapter: StarRocksEngineAdapter):
 def test_create_view(adapter: StarRocksEngineAdapter):
     """Test CREATE VIEW statement generation."""
     adapter.create_view("test_view", parse_one("SELECT a FROM tbl"))
-    
+
     assert to_sql_calls(adapter) == [
         "DROP VIEW IF EXISTS `test_view`",
         "CREATE VIEW `test_view` AS SELECT `a` FROM `tbl`",
