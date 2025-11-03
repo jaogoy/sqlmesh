@@ -6,14 +6,14 @@ MODEL (
     batch_size 30,
   ),
   owner test_user,
-  dialect starrocks,
   cron '@daily',
   start '2024-01-01',
   grain (order_id, event_date),
   partitioned_by (event_date),
   clustered_by (customer_id, region),
   physical_properties (
-    distributed_by = (kind='HASH', expressions=customer_id, buckets=10),
+    primary_key = (order_id, event_date),
+    distributed_by = (kind='HASH', expressions=order_id, buckets=10),
     partitions = (
       'PARTITION p202401 VALUES LESS THAN ("2024-02-01")',
       'PARTITION p202402 VALUES LESS THAN ("2024-03-01")',

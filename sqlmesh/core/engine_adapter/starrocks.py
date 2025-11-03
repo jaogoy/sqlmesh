@@ -16,8 +16,12 @@ from sqlmesh.core.engine_adapter.mixins import (
 from sqlmesh.core.engine_adapter.shared import (
     CommentCreationTable,
     CommentCreationView,
+    DataObject,
+    DataObjectType,
     set_catalog,
+    to_schema,
 )
+from sqlmesh.utils.errors import SQLMeshError
 
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import SchemaName, TableName
@@ -103,24 +107,27 @@ class StarRocksEngineAdapter(
     MAX_COLUMN_COMMENT_LENGTH = 255
     """Maximum length for column comments"""
 
-    SUPPORTS_INDEXES = False
+    SUPPORTS_INDEXES = True
     """
-    StarRocks does NOT support standalone CREATE INDEX statements.
+    StarRocks supports PRIMARY KEY in CREATE TABLE, but NOT standalone CREATE INDEX.
 
-    Indexes in StarRocks must be defined during table creation using:
-    - PRIMARY KEY: Automatically creates sorted index (already used for state tables)
-    - INDEX clause: For bloom filter, bitmap, inverted indexes in CREATE TABLE
+    We set this to True to enable PRIMARY KEY generation in CREATE TABLE statements.
+    The create_index() method is overridden to prevent actual CREATE INDEX execution.
+
+    Supported (defined in CREATE TABLE):
+    - PRIMARY KEY: Automatically creates sorted index
+    - INDEX clause: For bloom filter, bitmap, inverted indexes
 
     Example:
         CREATE TABLE t (
             id INT,
             name STRING,
             INDEX idx_name (name) USING BITMAP
-        ) PRIMARY KEY (id);
+        ) PRIMARY KEY (id);  -- ✅ Supported
 
-    Since SQLMesh state tables use PRIMARY KEY for the columns that would need
-    indexes, and PRIMARY KEY provides efficient lookups, we set this to False
-    to prevent CREATE INDEX statements that would fail.
+    NOT supported:
+        CREATE INDEX idx_name ON t (name);  -- ❌ Will be skipped by create_index()
+
     """
 
     SUPPORTS_REPLACE_TABLE = False
@@ -140,12 +147,398 @@ class StarRocksEngineAdapter(
     TODO: whether it's external catalogs, or includes the internal catalog
     """
 
+    SUPPORTS_TUPLE_IN = False
+    """
+    StarRocks does NOT support tuple IN syntax: (col1, col2) IN ((val1, val2), (val3, val4))
+
+    Instead, use OR with AND conditions:
+    (col1 = val1 AND col2 = val2) OR (col1 = val3 AND col2 = val4)
+
+    This is automatically handled by snapshot_id_filter and snapshot_name_version_filter
+    in sqlmesh/core/state_sync/db/utils.py when SUPPORTS_TUPLE_IN = False.
+    """
+
     # ==================== Schema Operations ====================
     # StarRocks supports CREATE/DROP SCHEMA the same as CREATE/DROP DATABSE.
     # So, no need to implement create_schema / drop_schema
 
+    # ==================== Index Operations ====================
+
+    def create_index(
+        self,
+        table_name: TableName,
+        index_name: str,
+        columns: t.Tuple[str, ...],
+        exists: bool = True,
+    ) -> None:
+        """
+        Override to prevent CREATE INDEX statements (not supported in StarRocks).
+
+        StarRocks does not support standalone CREATE INDEX statements.
+        Indexes must be defined during CREATE TABLE using INDEX clause.
+
+        Since SQLMesh state tables use PRIMARY KEY (which provides efficient indexing),
+        we simply log and skip additional index creation requests.
+
+        This is a known limitation also present in Doris, which incorrectly allows
+        CREATE INDEX to be attempted.
+
+        Args:
+            table_name: The name of the target table
+            index_name: The name of the index
+            columns: The list of columns that constitute the index
+            exists: Indicates whether to include the IF NOT EXISTS check
+        """
+        logger.info(
+            f"Skipping CREATE INDEX {index_name} on {table_name} - "
+            "StarRocks does not support standalone CREATE INDEX statements. "
+            "PRIMARY KEY provides equivalent indexing for columns: {columns}"
+        )
+        return
+
+    def delete_from(
+        self, table_name: TableName, where: t.Optional[t.Union[str, exp.Expression]] = None
+    ) -> None:
+        """
+        Delete from a table.
+        
+        StarRocks has limitations:
+        1. WHERE TRUE is not supported - use TRUNCATE TABLE instead
+        2. More complex WHERE conditions may have limitations
+        
+        Args:
+            table_name: The table to delete from
+            where: The where clause to filter rows to delete
+        """
+        # Parse where clause if it's a string
+        if isinstance(where, str):
+            from sqlglot import parse_one
+            where = parse_one(where, dialect=self.dialect)
+        
+        # If no where clause or WHERE TRUE, use TRUNCATE TABLE
+        if not where or where == exp.true():
+            table_expr = exp.to_table(table_name) if isinstance(table_name, str) else table_name
+            logger.info(
+                f"Converting DELETE FROM {table_name} WHERE TRUE to TRUNCATE TABLE "
+                "(StarRocks does not support WHERE TRUE in DELETE)"
+            )
+            self.execute(f"TRUNCATE TABLE {table_expr.sql(dialect=self.dialect, identify=True)}")
+            return
+        
+        # For other conditions, use parent implementation
+        super().delete_from(table_name, where)
+
+    def _where_clause_remove_boolean_literals(self, expression: exp.Expression) -> exp.Expression:
+        """
+        Remove TRUE/FALSE boolean literals from WHERE expressions.
+
+        StarRocks doesn't support boolean literals in WHERE clauses.
+        This method simplifies expressions like:
+        - (condition) AND TRUE -> condition
+        - (condition) OR FALSE -> condition
+        - TRUE AND (condition) -> condition
+        - WHERE TRUE -> 1=1 (though this case is handled by TRUNCATE conversion)
+        - WHERE FALSE -> 1=0
+
+        Args:
+            expression: The expression to clean
+
+        Returns:
+            Cleaned expression without boolean literals
+        """
+        def transform(node: exp.Expression) -> exp.Expression:
+            # Handle standalone TRUE/FALSE at the top level
+            if node == exp.true():
+                # Convert TRUE to 1=1
+                return exp.EQ(this=exp.Literal.number(1), expression=exp.Literal.number(1))
+            elif node == exp.false():
+                # Convert FALSE to 1=0
+                return exp.EQ(this=exp.Literal.number(1), expression=exp.Literal.number(0))
+
+            # Handle AND expressions
+            elif isinstance(node, exp.And):
+                left = node.this
+                right = node.expression
+
+                # Remove TRUE from AND
+                if left == exp.true():
+                    return right
+                if right == exp.true():
+                    return left
+
+            # Handle OR expressions
+            elif isinstance(node, exp.Or):
+                left = node.this
+                right = node.expression
+
+                # Remove FALSE from OR
+                if left == exp.false():
+                    return right
+                if right == exp.false():
+                    return left
+
+            return node
+
+        # Transform the expression tree
+        return expression.transform(transform, copy=True)
+
+    def _where_clause_convert_between_to_comparison(self, expression: exp.Expression) -> exp.Expression:
+        """
+        Convert BETWEEN expressions to >= AND <= comparisons.
+
+        StarRocks DUPLICATE KEY tables don't support BETWEEN in DELETE statements.
+        This method converts:
+        - col BETWEEN a AND b  ->  col >= a AND col <= b
+
+        Args:
+            expression: The expression potentially containing BETWEEN
+
+        Returns:
+            Expression with BETWEEN converted to comparisons
+        """
+        def transform(node: exp.Expression) -> exp.Expression:
+            if isinstance(node, exp.Between):
+                # Extract components: col BETWEEN low AND high
+                column = node.this  # The column being tested
+                low = node.args.get("low")  # Lower bound
+                high = node.args.get("high")  # Upper bound
+
+                if column and low and high:
+                    # Build: column >= low AND column <= high
+                    gte = exp.GTE(this=column.copy(), expression=low.copy())
+                    lte = exp.LTE(this=column.copy(), expression=high.copy())
+                    return exp.And(this=gte, expression=lte)
+
+            return node
+
+        # Transform the expression tree
+        return expression.transform(transform, copy=True)
+
+    def execute(
+        self,
+        expressions: t.Union[str, exp.Expression, t.Sequence[exp.Expression]],
+        ignore_unsupported_errors: bool = False,
+        quote_identifiers: bool = True,
+        track_rows_processed: bool = False,
+        **kwargs: t.Any,
+    ) -> None:
+        """
+        Override execute to strip FOR UPDATE from queries (not supported in StarRocks).
+
+        StarRocks is an OLAP database and does not support row-level locking via
+        SELECT ... FOR UPDATE. This method removes lock expressions before execution.
+
+        Args:
+            expressions: SQL expression(s) to execute
+            ignore_unsupported_errors: Whether to ignore unsupported errors
+            quote_identifiers: Whether to quote identifiers
+            track_rows_processed: Whether to track rows processed
+            **kwargs: Additional arguments
+        """
+        from sqlglot.helper import ensure_list
+
+        # Process expressions to remove FOR UPDATE
+        processed_expressions = []
+        for e in ensure_list(expressions):
+            if isinstance(e, exp.Expression):
+                # Remove lock (FOR UPDATE) from SELECT statements
+                if isinstance(e, exp.Select) and e.args.get("locks"):
+                    e = e.copy()
+                    e.set("locks", None)
+                processed_expressions.append(e)
+            else:
+                # For string SQL, we can't easily remove FOR UPDATE without parsing
+                # Just pass through and let StarRocks reject it if present
+                processed_expressions.append(e)
+
+        # Call parent execute with processed expressions
+        super().execute(
+            processed_expressions,
+            ignore_unsupported_errors=ignore_unsupported_errors,
+            quote_identifiers=quote_identifiers,
+            track_rows_processed=track_rows_processed,
+            **kwargs,
+        )
 
     # ==================== Table Creation (CORE IMPLEMENTATION) ====================
+
+    def _extract_and_validate_key_columns(
+        self,
+        table_properties: t.Dict[str, t.Any],
+        primary_key: t.Optional[t.Tuple[str, ...]] = None,
+    ) -> t.Tuple[t.Optional[str], t.Optional[t.Tuple[str, ...]]]:
+        """
+        Extract and validate key columns from table_properties.
+
+        StarRocks Table Types and Key Requirements:
+        1. PRIMARY KEY table - primary_key property (StarRocks 3.0+)
+        2. UNIQUE KEY table - unique_key property (legacy)
+        3. DUPLICATE KEY table - duplicate_key property
+        4. AGGREGATE KEY table - aggregate_key property (implicit)
+
+        All key types require:
+        - Key columns must be the first N columns in CREATE TABLE
+        - Column order must match the KEY clause order
+
+        Priority:
+        - Parameter primary_key > table_properties primary_key
+        - Only one key type allowed per table
+
+        Args:
+            table_properties: Table properties dictionary (lowercase keys expected)
+            primary_key: Primary key from method parameter (highest priority)
+
+        Returns:
+            Tuple of (key_type, key_columns)
+            - key_type: One of 'primary_key', 'unique_key', 'duplicate_key', 'aggregate_key', None
+            - key_columns: Tuple of column names, or None
+
+        Raises:
+            SQLMeshError: If multiple key types are defined or column extraction fails
+        """
+        # Check which key types are present (keys are lowercase in table_properties)
+        key_types_present = []
+        for key_type in ["primary_key", "unique_key", "duplicate_key", "aggregate_key"]:
+            if key_type in table_properties:
+                key_types_present.append(key_type)
+
+        # Validate only one key type in table_properties
+        if len(key_types_present) > 1:
+            raise SQLMeshError(
+                f"Multiple key types defined in table_properties: {key_types_present}. "
+                "Only one key type is allowed per table."
+            )
+
+        # Priority: parameter primary_key > table_properties
+        if primary_key:
+            # If parameter is provided and table_properties also has a key, warn and use parameter
+            if key_types_present:
+                logger.warning(
+                    f"Both parameter primary_key and table_properties {key_types_present[0]} "
+                    f"are defined. Using parameter primary_key: {primary_key}"
+                )
+                # Remove from table_properties to avoid duplicate
+                table_properties.pop(key_types_present[0], None)
+            return ("primary_key", primary_key)
+
+        # Extract from table_properties
+        if not key_types_present:
+            return (None, None)
+
+        key_type = key_types_present[0]
+        key_expr = table_properties.pop(key_type)
+
+        # Convert expression to tuple of column names
+        key_columns = self._expr_to_column_tuple(key_expr)
+
+        logger.info(
+            f"Extracted {key_type} from table_properties: {key_columns}"
+        )
+
+        return (key_type, key_columns)
+
+    def _expr_to_column_tuple(
+        self, expr: t.Any
+    ) -> t.Tuple[str, ...]:
+        """
+        Convert various expression types to tuple of column names.
+
+        Handles:
+        - exp.Tuple: Tuple of Column expressions
+        - list/tuple: List of Column expressions or strings
+        - exp.Column: Single column
+        - str: Single column name
+
+        Args:
+            expr: Expression to convert
+
+        Returns:
+            Tuple of column names
+
+        Raises:
+            SQLMeshError: If expression type is unsupported
+        """
+        if isinstance(expr, exp.Tuple):
+            # exp.Tuple with Column expressions
+            return tuple(col.name for col in expr.expressions)
+        elif isinstance(expr, (list, tuple)):
+            # List/tuple of expressions or strings
+            return tuple(
+                col.name if isinstance(col, exp.Column) else str(col)
+                for col in expr
+            )
+        elif isinstance(expr, exp.Column):
+            # Single column
+            return (expr.name,)
+        elif isinstance(expr, str):
+            # Single column name as string
+            return (expr,)
+        else:
+            raise SQLMeshError(
+                f"Unsupported key column expression type: {type(expr)}. "
+                f"Expected exp.Tuple, list, tuple, exp.Column, or str."
+            )
+
+    def _reorder_columns_for_key(
+        self,
+        target_columns_to_types: t.Dict[str, exp.DataType],
+        key_columns: t.Tuple[str, ...],
+        key_type: str = "key",
+    ) -> t.Dict[str, exp.DataType]:
+        """
+        Reorder columns to place key columns first.
+
+        StarRocks Constraint (ALL Table Types):
+        Key columns (PRIMARY/UNIQUE/DUPLICATE/AGGREGATE) MUST be the first N columns
+        in the CREATE TABLE statement, in the same order as defined in the KEY clause.
+
+        Example:
+            Input:
+                columns = {"customer_id": INT, "order_id": BIGINT, "event_date": DATE}
+                key_columns = ("order_id", "event_date")
+                key_type = "primary_key"
+
+            Output:
+                {"order_id": BIGINT, "event_date": DATE, "customer_id": INT}
+
+        Args:
+            target_columns_to_types: Original column order (from SELECT)
+            key_columns: Key column names in desired order
+            key_type: Type of key for logging (primary_key, unique_key, etc.)
+
+        Returns:
+            Reordered columns with key columns first
+
+        Raises:
+            SQLMeshError: If a key column is not found in target_columns_to_types
+        """
+        # Validate that all key columns exist
+        missing_key_cols = set(key_columns) - set(target_columns_to_types.keys())
+        if missing_key_cols:
+            raise SQLMeshError(
+                f"{key_type} columns {missing_key_cols} not found in table columns. "
+                f"Available columns: {list(target_columns_to_types.keys())}"
+            )
+
+        # Build new ordered dict: key columns first, then remaining columns
+        reordered = {}
+
+        # 1. Add key columns in key order
+        for key_col in key_columns:
+            reordered[key_col] = target_columns_to_types[key_col]
+
+        # 2. Add remaining columns (preserve original order)
+        for col_name, col_type in target_columns_to_types.items():
+            if col_name not in key_columns:
+                reordered[col_name] = col_type
+
+        logger.info(
+            f"Reordered columns for {key_type.upper()}: "
+            f"Original order: {list(target_columns_to_types.keys())}, "
+            f"New order: {list(reordered.keys())}"
+        )
+
+        return reordered
 
     def _build_table_properties_exp(
         self,
@@ -163,13 +556,13 @@ class StarRocksEngineAdapter(
     ) -> t.Optional[exp.Properties]:
         """
         Build table properties for StarRocks CREATE TABLE statement.
-        
+
         Handles:
         - Table comment
         - Partition expressions (including RANGE/LIST)
         - Distribution (HASH/RANDOM)
         - Other properties (replication_num, storage_medium, etc.)
-        
+
         Args:
             table_properties: Dictionary containing:
                 - distributed_by: Tuple of EQ expressions (kind, expressions, buckets)
@@ -178,7 +571,7 @@ class StarRocksEngineAdapter(
         """
         properties: t.List[exp.Expression] = []
         table_properties_copy = dict(table_properties) if table_properties else {}
-        
+
         # 1. Add table comment
         if table_description:
             properties.append(
@@ -186,7 +579,7 @@ class StarRocksEngineAdapter(
                     this=exp.Literal.string(self._truncate_table_comment(table_description))
                 )
             )
-        
+
         # 2. Handle distributed_by (DISTRIBUTED BY HASH(...) BUCKETS n)
         distributed_by = table_properties_copy.pop("distributed_by", None)
         if distributed_by is not None:
@@ -203,30 +596,30 @@ class StarRocksEngineAdapter(
                             distributed_info[key] = [expr.expression]
                         else:
                             distributed_info[key] = expr.expression
-            
+
             # Build DistributedByProperty
             if distributed_info:
                 kind = distributed_info.get("kind", "HASH")
                 expressions = distributed_info.get("expressions", [])
                 if not isinstance(expressions, list):
                     expressions = [expressions] if expressions else []
-                
+
                 buckets = distributed_info.get("buckets")
-                
+
                 properties.append(
                     exp.DistributedByProperty(
                         kind=exp.Var(this=kind),  # Use Var for kind
-                        expressions=[exp.to_column(e) if not isinstance(e, exp.Expression) else e 
+                        expressions=[exp.to_column(e) if not isinstance(e, exp.Expression) else e
                                    for e in expressions],
                         buckets=exp.Literal.number(buckets) if buckets else None,
                         order=None,
                     )
                 )
-        
+
         # 3. Handle partitioned_by (PARTITION BY RANGE/LIST/Expression)
         # Note: partitions are separate - they're the actual partition definitions
         # partitioned_by contains the column expressions
-        
+
         # 4. Handle other properties (replication_num, storage_medium, etc.)
         # Collect all remaining literal properties into PROPERTIES(...)
         other_props = []
@@ -234,7 +627,7 @@ class StarRocksEngineAdapter(
             # Skip special keys that are handled elsewhere
             if key in ("partitions",):  # partitions handled separately
                 continue
-            
+
             # Convert value to Property
             if isinstance(value, exp.Literal):
                 other_props.append(
@@ -243,11 +636,11 @@ class StarRocksEngineAdapter(
             elif isinstance(value, (str, int, float)):
                 other_props.append(
                     exp.Property(
-                        this=exp.to_identifier(key), 
+                        this=exp.to_identifier(key),
                         value=exp.Literal.string(str(value))
                     )
                 )
-        
+
         if other_props:
             # Wrap in Properties node for PROPERTIES(...) syntax
             properties.append(
@@ -274,16 +667,30 @@ class StarRocksEngineAdapter(
 
         - StarRocks: Supports PRIMARY KEY natively
           CREATE TABLE t (id INT) PRIMARY KEY(id)
-          → Pass primary_key directly to base class
+          → Extract primary_key from table_properties and pass to base class
 
         - Doris: Uses UNIQUE KEY instead
           CREATE TABLE t (id INT) UNIQUE KEY(id)
           → Convert primary_key to unique_key in table_properties
 
+        StarRocks Key Column Ordering Constraint:
+        ALL key types (PRIMARY KEY, UNIQUE KEY, DUPLICATE KEY, AGGREGATE KEY) require:
+        - Key columns MUST be the first N columns in CREATE TABLE
+        - Column order MUST match the KEY clause order
+        - Example: PRIMARY KEY(order_id, event_date) requires:
+          CREATE TABLE t (
+            order_id INT,      -- ✅ 1st column matches 1st key
+            event_date DATE,   -- ✅ 2nd column matches 2nd key
+            customer_id INT,   -- ✅ Other columns follow
+            ...
+          )
+
         Implementation:
-        - StarRocks can use base class implementation directly
-        - Just pass primary_key as-is without conversion
-        - Base class generates: PRIMARY KEY(col1, col2, ...)
+        1. Priority: Parameter primary_key > table_properties primary_key
+        2. Extract key columns from table_properties (primary_key, unique_key, duplicate_key, aggregate_key)
+        3. Validate no conflicts between different key types
+        4. Reorder target_columns_to_types to place key columns first
+        5. Pass to base class for SQL generation
 
         Reference: Doris converts primary_key → unique_key in table_properties
         See: doris.py _create_table_from_columns()
@@ -291,43 +698,60 @@ class StarRocksEngineAdapter(
         Args:
             table_name: Fully qualified table name
             target_columns_to_types: Column definitions {name: DataType}
-            primary_key: Primary key column names (StarRocks supports this!)
+            primary_key: Primary key column names (parameter takes priority)
             exists: Add IF NOT EXISTS clause
             table_description: Table comment
             column_descriptions: Column comments {column_name: comment}
             kwargs: Additional properties (partitioned_by, distributed_by, etc.)
 
         Example:
-            adapter._create_table_from_columns(
-                table_name="db.sales",
-                target_columns_to_types={
-                    "id": exp.DataType.build("INT"),
-                    "amount": exp.DataType.build("DECIMAL(18,2)"),
-                    "dt": exp.DataType.build("DATE")
-                },
-                primary_key=("id",),
-                table_properties={
-                    "distributed_by": {...},
-                    "partitioned_by": [exp.Column("dt")]
-                }
+            # In MODEL:
+            physical_properties (
+                primary_key = (order_id, event_date),
+                distributed_by = (kind='HASH', expressions=customer_id, buckets=10)
             )
 
-            Generates:
+            # Generates:
             CREATE TABLE IF NOT EXISTS db.sales (
-                id INT,
-                amount DECIMAL(18,2),
-                dt DATE
+                order_id INT,
+                event_date DATE,
+                customer_id INT
             )
-            PRIMARY KEY(id)
-            PARTITION BY RANGE(dt) ()
-            DISTRIBUTED BY HASH(id) BUCKETS 10
+            PRIMARY KEY(order_id, event_date)
+            DISTRIBUTED BY HASH(customer_id) BUCKETS 10
         """
-        # StarRocks supports PRIMARY KEY natively - no conversion needed!
-        # Just pass primary_key directly to base class
+        # Use setdefault to simplify table_properties access
+        table_properties = kwargs.setdefault("table_properties", {})
+
+        # Extract and validate key columns from table_properties
+        # Priority: parameter primary_key > table_properties
+        key_type, key_columns = self._extract_and_validate_key_columns(
+            table_properties, primary_key
+        )
+
+        # Update primary_key based on extracted key type
+        if key_type == "primary_key":
+            primary_key = key_columns
+        elif key_type in ("unique_key", "duplicate_key", "aggregate_key"):
+            # For other key types, columns still need reordering but handled differently
+            # These will be processed by _build_table_properties_exp()
+            primary_key = None  # Don't generate PRIMARY KEY clause
+        else:
+            # No key defined
+            primary_key = None
+            key_columns = None
+
+        # StarRocks key column ordering constraint: All key types need reordering
+        if key_columns:
+            target_columns_to_types = self._reorder_columns_for_key(
+                target_columns_to_types, key_columns, key_type or "key"
+            )
+
+        # Pass to base class (will generate PRIMARY KEY if primary_key is set)
         super()._create_table_from_columns(
             table_name=table_name,
             target_columns_to_types=target_columns_to_types,
-            primary_key=primary_key,  # Pass as-is (unlike Doris which converts to unique_key)
+            primary_key=primary_key,
             exists=exists,
             table_description=table_description,
             column_descriptions=column_descriptions,

@@ -6,6 +6,7 @@ gateways:
       port: 9030
       user: root
       password: ""
+      database: mytest
 
 default_gateway: local
 

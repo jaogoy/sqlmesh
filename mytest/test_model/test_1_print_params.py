@@ -86,20 +86,20 @@ def format_param(value, indent=0):
 
 def main():
     args = parse_args()
-    
+
     print("=" * 100)
     print("  Direct Parameter Print Test")
     print("=" * 100)
 
     test_dir = Path(__file__).parent
     context = Context(paths=[str(test_dir)])
-    
+
     # Enable SQL logging by setting adapter's execute_log_level to INFO
     if hasattr(context, '_engine_adapter') and context._engine_adapter:
         context._engine_adapter = context._engine_adapter.with_settings(
             execute_log_level=logging.INFO
         )
-    
+
     print(f"\n✓ Loaded {len(context.models)} models\n")
 
     # Filter models if specific model requested
