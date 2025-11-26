@@ -35,7 +35,143 @@
 
 ## 2. 核心机制：Expression → SQL 生成
 
-### 2.1 Generator 的工作原理
+### 2.1 SQLGlot Expression 结构基础
+
+SQLGlot 使用 AST (Abstract Syntax Tree) 表示 SQL，每个节点都是 `exp.Expression` 的子类。理解 Expression 的内部结构对于正确构建 SQL 至关重要。
+
+#### Expression 的通用属性
+
+每个 Expression 对象有以下标准属性：
+
+| 属性 | 用途 | 示例 |
+|------|------|------|
+| `this` | 主操作对象/左操作数 | 二元操作的左侧，函数的第一参数 |
+| `expression` | 次要对象/右操作数 | 二元操作的右侧 |
+| `expressions` | 多个子表达式列表 | SELECT 的列，函数的剩余参数 |
+| 自定义字段 | 特定类型专用 | `buckets`, `unit`, `kind` 等 |
+
+**重要**：不同 Expression 类型对这些属性的使用方式**不一致**，必须通过调试或查看源码才能确定具体结构！
+
+#### 常见 Expression 类型的结构模式
+
+**1. 二元操作（Binary Operations）**
+
+```python
+# exp.EQ, exp.GT, exp.LT, exp.And, exp.Or 等
+exp.EQ(
+    this=exp.Column("key"),           # 左操作数
+    expression=exp.Literal("value")   # 右操作数
+)
+# SQL: key = 'value'
+
+# 别名访问
+eq.left   # 等同于 eq.this
+eq.right  # 等同于 eq.expression
+```
+
+**2. 函数调用（Functions）**
+
+```python
+# 普通函数：this = 第一参数
+exp.Coalesce(
+    this=exp.Column("a"),                    # 第一参数
+    expressions=[exp.Column("b"), exp.Column("c")]  # 其余参数
+)
+# SQL: COALESCE(a, b, c)
+
+# 匿名函数：this = 函数名（字符串！）
+exp.Anonymous(
+    this="RANGE",                            # 函数名
+    expressions=[exp.Column("dt")]          # 所有参数
+)
+# SQL: RANGE(dt)
+```
+
+**3. 容器类型（Containers）**
+
+```python
+# Tuple/Array：无 this，只有 expressions
+exp.Tuple(
+    expressions=[exp.Column("a"), exp.Column("b")]
+)
+# SQL: (a, b)
+
+# Paren：this = 包裹的表达式
+exp.Paren(
+    this=exp.Add(this=a, expression=b)
+)
+# SQL: (a + b)
+```
+
+**4. DDL 属性（Table Properties）**
+
+```python
+# 直接列表型：无 this，只有 expressions
+exp.UniqueKeyProperty(
+    expressions=[exp.Column("id"), exp.Column("name")]
+)
+# SQL: UNIQUE KEY(id, name)
+
+# Schema 包裹型：this = Schema wrapper
+exp.PartitionedByProperty(
+    this=exp.Schema(
+        expressions=[exp.Column("dt")]
+    )
+)
+# SQL: PARTITIONED BY (dt)
+```
+
+**5. 查询语句（特殊结构）**
+
+```python
+# exp.Select：this = FROM 子句（注意不是 SELECT 列！）
+exp.Select(
+    this=exp.From(this=exp.Table("table")),  # FROM 是 this!
+    expressions=[exp.Column("a"), exp.Column("b")]  # SELECT 列是 expressions
+)
+# SQL: SELECT a, b FROM table
+
+# exp.Create：this = 表结构，expression = 查询（CTAS）
+exp.Create(
+    this=exp.Schema(...),      # 表定义
+    expression=exp.Select(...), # AS SELECT ...
+    properties=exp.Properties(...)
+)
+```
+
+#### 为什么结构不一致？
+
+**历史原因**和**语义差异**导致不同 Expression 使用不同模式：
+
+1. **语义适配**：
+   - `PARTITION BY` 支持表达式 → 用 `Schema` 包裹以支持类型标注
+   - `PRIMARY KEY` 只允许列名 → 直接用 `expressions` 列表
+
+2. **演化过程**：
+   - SQLGlot 不同版本添加的功能使用了不同设计模式
+   - 为了向后兼容，无法统一结构
+
+3. **调试必要性**：
+   - **无法通过命名推断结构**
+   - 必须通过 `print(expr)` 或查看 `arg_types` 确定实际结构
+   - 查看 Generator 源码了解预期结构
+
+**调试技巧**：
+```python
+# 查看 Expression 的参数定义
+print(exp.PartitionedByProperty.arg_types)
+# {'this': True}  # 需要 this，通常是 Schema
+
+print(exp.UniqueKeyProperty.arg_types)
+# {'expressions': True}  # 需要 expressions 列表
+
+# 打印实际结构
+parsed = parse_one("PARTITIONED BY (col1, col2)", into=exp.PartitionedByProperty)
+print(parsed)
+# PartitionedByProperty(this=Schema(expressions=[Column(...)]))
+```
+
+### 2.2 Generator 的工作原理
 
 SQLGlot Generator 通过**双派发模式**（Double Dispatch）将 Expression 对象转换为 SQL 字符串：
 
@@ -55,7 +191,7 @@ class Generator:
     def partitionbyrangeproperty_sql(self, expression: exp.PartitionByRangeProperty) -> str:
         partition_cols = self.expressions(expression.partition_expressions)
         partition_defs = self.expressions(expression.create_expressions)
-        **return** f"PARTITION BY RANGE({partition_cols}) ({partition_defs})"
+        return f"PARTITION BY RANGE({partition_cols}) ({partition_defs})"
 ```
 
 **关键点**：
@@ -63,6 +199,7 @@ class Generator:
 - **只关心 Expression 的结构是否符合预期**
 - 结构正确 → 生成正确的 SQL
 - 结构错误 → 生成错误的 SQL 或报错
+- **必须准确了解每种 Expression 的内部结构要求**
 
 ## 3. 表属性的 Expression 结构要求
 
@@ -578,8 +715,48 @@ print(properties_exp.sql(dialect="doris"))
 | `PRIMARY KEY(id)` | `exp.PrimaryKeyColumnConstraint` | `expressions=[exp.Column("id")]` |
 | `PARTITION BY RANGE(dt)` | `exp.PartitionByRangeProperty` | `partition_expressions=[...]`<br>`create_expressions=[...]` |
 | `PARTITION BY LIST(region)` | `exp.PartitionByListProperty` | `partition_expressions=[...]`<br>`create_expressions=[...]` |
+| `PARTITIONED BY (dt)` | `exp.PartitionedByProperty` | `this=exp.Schema(expressions=[...])` |
 | `DISTRIBUTED BY HASH(id) BUCKETS 10` | `exp.DistributedByProperty` | `expressions=[...]`<br>`buckets=exp.Literal.number(10)` |
 | `COMMENT 'table comment'` | `exp.SchemaCommentProperty` | `this=exp.Literal.string("...")` |
+
+### 常见 Expression 类型的 this/expression/expressions 使用方式
+
+| Expression 类型 | `this` | `expression` | `expressions` | 示例/注释 |
+|----------------|--------|--------------|---------------|----------|
+| **二元操作** | | | | |
+| `EQ`, `GT`, `LT`, `GTE`, `LTE` | 左操作数 | 右操作数 | - | `a = b` → `EQ(this=a, expression=b)` |
+| `And`, `Or` | 左操作数 | 右操作数 | - | `a AND b` → `And(this=a, expression=b)` |
+| `Add`, `Sub`, `Mul`, `Div` | 左操作数 | 右操作数 | - | `a + b` → `Add(this=a, expression=b)` |
+| **一元操作** | | | | |
+| `Not` | 被否定的表达式 | - | - | `NOT a` → `Not(this=a)` |
+| `Paren` | 被括号包裹的表达式 | - | - | `(a + b)` → `Paren(this=Add(...))` |
+| **函数** | | | | |
+| 普通函数（`Coalesce` 等） | 第一参数 | - | 剩余参数 | `COALESCE(a, b)` → `Coalesce(this=a, expressions=[b])` |
+| `Anonymous` | **函数名（字符串！）** | - | 所有参数 | `RANGE(dt)` → `Anonymous(this='RANGE', expressions=[dt])` |
+| **容器** | | | | |
+| `Tuple` | - | - | 元素列表 | `(a, b)` → `Tuple(expressions=[a, b])` |
+| `Array` | - | - | 元素列表 | `[a, b]` → `Array(expressions=[a, b])` |
+| `Schema` | 表（可选） | - | 列定义列表 | `(col1 INT, col2 STRING)` → `Schema(expressions=[...])` |
+| **DDL 属性** | | | | |
+| `UniqueKeyProperty` | - | - | 列列表 | `UNIQUE KEY(a, b)` → `UniqueKeyProperty(expressions=[a, b])` |
+| `PrimaryKeyColumnConstraint` | - | - | 列列表 | `PRIMARY KEY(a, b)` → `PrimaryKeyColumnConstraint(expressions=[a, b])` |
+| `PartitionedByProperty` | **Schema 包裹！** | - | - | `PARTITIONED BY (dt)` → `PartitionedByProperty(this=Schema(...))` |
+| `DistributedByProperty` | - | - | 列列表 | 还有 `buckets` 自定义字段 |
+| `Properties` | - | - | Property 列表 | 容器，包含多个 Property |
+| `Property` | 属性名（字符串） | 属性值 | - | `key = value` → `Property(this='key', expression=value)` |
+| **查询语句** | | | | |
+| `Select` | **FROM 子句！** | - | SELECT 列列表 | `SELECT a FROM t` → `Select(this=From(...), expressions=[a])` |
+| `From` | 表/子查询 | - | - | `FROM table` → `From(this=Table(...))` |
+| `Create` | Schema/Table | CTAS 查询 | - | `CREATE TABLE t AS SELECT...` → `Create(this=Schema, expression=Select)` |
+| `Insert` | 表 | VALUES/SELECT | - | `INSERT INTO t SELECT...` → `Insert(this=Table, expression=Select)` |
+
+**关键发现**：
+1. **`exp.Anonymous`**：`this` 是函数名（字符串），不是参数！
+2. **`exp.PartitionedByProperty`**：`this` 是 `Schema` wrapper，需要 `.this.expressions` 解包
+3. **`exp.Select`**：`this` 是 `FROM` 子句，`expressions` 才是 SELECT 列
+4. **`exp.Property`**：`this` 是属性名（字符串），`expression` 是属性值
+5. **容器类型**（`Tuple`/`Array`/`Properties`）：只有 `expressions`，没有 `this`
+6. **调试优先**：结构不统一，必须通过 `print(expr)` 或查看 `arg_types` 确认实际结构
 
 ### 关键文件参考
 
