@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import logging
-import typing as t
-
+import sqlglot
 from sqlglot import exp
+import typing as t
 
 from sqlmesh.core.engine_adapter.base import (
     InsertOverwriteStrategy,
@@ -29,6 +29,1245 @@ if t.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+###############################################################################
+# Declarative Type System for Property Validation and Normalization
+###############################################################################
+"""
+Declarative type system for property validation and normalization.
+
+This module provides a declarative way to define property types with clear separation
+between validation (type checking) and normalization (type conversion).
+"""
+Validated = t.Any  # validated intermediate value (AST nodes, string, list...)
+Normalized = t.Any  # final normalized output
+
+# Allowed outputs for EnumType normalize / or general property outputs.
+PROPERTY_OUTPUT_TYPES = {
+    "str",           # "HASH"
+    "identifier",    # exp.Identifier
+    "literal",       # exp.Literal.string("HASH")
+    "column",        # exp.Column(this="HASH")
+    "ast_expr",      # generic exp.Expression
+}
+
+
+# ============================================================
+# Fragment parser (robust-ish)
+# ============================================================
+def parse_fragment(text: str) -> t.Union[exp.Expression, t.List[exp.Expression]]:
+    """
+    Try to parse a DSL fragment into SQLGlot AST(s).
+
+    Behavior:
+    1. If parse_one succeeds, return the exp.Expression.
+    2. If fails but text contains comma, split by commas and parse each part.
+    3. If it's parenthesized like "(a, b)", parse and return exp.Tuple or list.
+    4. If it's a simple token like "IDENT", return exp.Identifier.
+    """
+    if isinstance(text, exp.Expression):
+        return text
+
+    if not isinstance(text, str):
+        raise TypeError("parse_fragment expects a string")
+
+    s = text.strip()
+    # 1) try full parse
+    try:
+        parsed = sqlglot.parse_one(s)
+        return parsed
+    except Exception:
+        raise ValueError(f"Unable to parse fragment: {s}")
+
+
+# ============================================================
+# Base Type
+# ============================================================
+class DeclarativeType:
+    """
+    Base class for declarative type system.
+
+    Design Philosophy:
+    -----------------
+    - validate(value): Type checking only - returns validated intermediate value or None
+    - normalize(validated): Type conversion only - transforms to target output format
+
+    Methods:
+    --------
+    validate(value) -> Optional[Validated]
+        Check if value conforms to this type, maybe include some tiny different types
+        Returns: Validated intermediate value if valid, None otherwise.
+
+    normalize(validated) -> Normalized
+        Convert validated intermediate value to final output format.
+        Returns: Normalized value in target format.
+
+    __call__(value) -> Normalized
+        Convenience method: validate + normalize in one step.
+    """
+
+    def validate(self, value: t.Any) -> t.Optional[Validated]:
+        """Check if value conforms to this type. Return validated value or None.
+        String that can be parsed as literal
+        """
+        raise NotImplementedError(f"{self.__class__.__name__}.validate() must be implemented")
+
+    def normalize(self, validated: Validated) -> Normalized:
+        """Convert validated intermediate value to final output format."""
+        # Default: identity transformation
+        return validated
+
+    def __call__(self, value: t.Any) -> Normalized:
+        """Validate and normalize in one step."""
+        validated = self.validate(value)
+        if validated is None:
+            raise ValueError(
+                f"Value {value!r} does not conform to type {self.__class__.__name__}"
+            )
+        return self.normalize(validated)
+
+
+# ============================================================
+# Primitive Types
+# ============================================================
+class StringType(DeclarativeType):
+    """
+    String type validator.
+
+    Accepts:
+    - Python str only
+
+    Validation: Returns the string if valid, None otherwise.
+    Normalization: Returns the string as-is (identity).
+    """
+
+    def __init__(self, normalized_type: str = "str"):
+        """
+        Args:
+            normalized_type: Target type for normalization.
+                - "literal": Convert to exp.Literal.string()
+                - "str": Keep as string (default)
+                - "identifier": Convert to exp.Identifier
+        """
+        self.normalized_type = normalized_type
+
+    def validate(self, value: t.Any) -> t.Optional[str]:
+        """Check if value is a Python string. Returns string or None."""
+        return value if isinstance(value, str) else None
+
+    def normalize(self, validated: str) -> str:
+        """Return string as-is (identity normalization)."""
+        return validated
+
+
+class LiteralType(DeclarativeType):
+    """
+    Literal type validator.
+
+    Accepts:
+    - exp.Literal only (from AST)
+    - String that can be parsed as literal
+
+    Validation: Returns exp.Literal if valid, None otherwise.
+    Normalization: Converts to target type based on normalized_type parameter.
+    """
+
+    def __init__(self, normalized_type: t.Optional[str] = None):
+        """
+        Args:
+            normalized_type: Target type for normalization.
+                - None: Keep as exp.Literal (default)
+                - "literal": Keep as exp.Literal
+                - "str": Convert to Python string
+        """
+        self.normalized_type = normalized_type
+
+    def validate(self, value: t.Any) -> t.Optional[exp.Literal]:
+        """Check if value is a literal type. Returns exp.Literal or None."""
+        # Try parsing string first
+        if isinstance(value, str):
+            try:
+                value = parse_fragment(value)
+            except Exception:
+                return None
+
+        # Check if it's a Literal
+        if isinstance(value, exp.Literal):
+            return value
+
+        return None
+
+    def normalize(self, validated: exp.Literal) -> t.Union[exp.Literal, str]:
+        """Convert to target type based on normalized_type."""
+        if self.normalized_type == "str":
+            return validated.this
+        # None or "literal" - keep as-is
+        return validated
+
+
+class IdentifierType(DeclarativeType):
+    """
+    Identifier type validator.
+
+    Accepts:
+    - exp.Identifier only
+    - String that can be parsed as identifier
+
+    Validation: Returns exp.Identifier if valid, None otherwise.
+    Normalization: Converts to target type based on normalized_type parameter.
+    """
+
+    def __init__(self, normalized_type: t.Optional[str] = None):
+        """
+        Args:
+            normalized_type: Target type for normalization.
+                - None: Keep as exp.Identifier (default)
+                - "literal": Convert to exp.Literal.string()
+                - "str": Convert to Python string
+                - "identifier": Keep as exp.Identifier
+                - "column": Convert to exp.Column
+        """
+        self.normalized_type = normalized_type
+
+    def validate(self, value: t.Any) -> t.Optional[exp.Identifier]:
+        """Check if value is an identifier type. Returns exp.Identifier or None."""
+        # Try parsing string first
+        if isinstance(value, str):
+            try:
+                value = parse_fragment(value)
+            except Exception:
+                return None
+
+        # Check if it's an Identifier
+        if isinstance(value, exp.Identifier):
+            return value
+
+        return None
+
+    def normalize(self, validated: exp.Identifier) -> t.Union[exp.Identifier, exp.Column, exp.Literal, str]:
+        """Convert to target type based on normalized_type."""
+        if self.normalized_type == "column":
+            return exp.column(validated.this)
+        if self.normalized_type == "literal":
+            return exp.Literal.string(validated.this)
+        if self.normalized_type == "str":
+            return validated.this
+        # None or "identifier" - keep as-is
+        return validated
+
+
+class ColumnType(DeclarativeType):
+    """
+    Column type validator.
+
+    Accepts:
+    - exp.Column only
+    - String that can be parsed as column
+
+    Validation: Returns exp.Column if valid, None otherwise.
+    Normalization: Converts to target type based on normalized_type parameter.
+    """
+
+    def __init__(self, normalized_type: t.Optional[str] = None):
+        """
+        Args:
+            normalized_type: Target type for normalization.
+                - None: Keep as exp.Column (default)
+                - "literal": Convert to exp.Literal.string()
+                - "str": Convert to Python string
+                - "identifier": Convert to exp.Identifier
+                - "column": Keep as exp.Column
+        """
+        self.normalized_type = normalized_type
+
+    def validate(self, value: t.Any) -> t.Optional[exp.Column]:
+        """Check if value is a column type. Returns exp.Column or None."""
+        # Try parsing string first
+        if isinstance(value, str):
+            try:
+                value = parse_fragment(value)
+            except Exception:
+                return None
+
+        # Check if it's a Column
+        if isinstance(value, exp.Column):
+            return value
+
+        return None
+
+    def normalize(self, validated: exp.Column) -> t.Union[exp.Column, exp.Identifier, exp.Literal, str]:
+        """Convert to target type based on normalized_type."""
+        if self.normalized_type == "identifier":
+            return exp.Identifier(this=validated.this)
+        if self.normalized_type == "literal":
+            return exp.Literal.string(validated.this)
+        if self.normalized_type == "str":
+            return validated.this
+        # None or "column" - keep as-is
+        return validated
+
+
+class EqType(DeclarativeType):
+    """
+    EQ expression type validator (key=value pairs).
+
+    Accepts:
+    - exp.EQ(left, right)
+    - String that can be parsed as key=value
+
+    Validation: Returns (key_name, value_expr) tuple if valid, None otherwise.
+    Normalization: Returns the (key, value) tuple as-is.
+    """
+
+    def validate(self, value: t.Any) -> t.Optional[t.Tuple[str, t.Any]]:
+        """Check if value is an EQ expression. Returns (key, value) tuple or None."""
+        # Try parsing string first
+        if isinstance(value, str):
+            try:
+                value = parse_fragment(value)
+            except Exception:
+                return None
+
+        # Check if it's an EQ expression
+        if isinstance(value, exp.EQ):
+            # Extract key name from left side
+            left = value.this
+            # Extract value from right side
+            right = value.expression
+
+            key_name = None
+            if isinstance(left, exp.Column):
+                key_name = left.this.name if hasattr(left.this, 'name') else str(left.this)
+            elif isinstance(left, exp.Identifier):
+                key_name = left.this
+            elif isinstance(left, str):
+                key_name = left
+            else:
+                key_name = str(left)
+
+            return (key_name, right)
+
+        return None
+
+    def normalize(self, validated: t.Tuple[str, t.Any]) -> t.Tuple[str, t.Any]:
+        """Return (key, value) tuple as-is (identity normalization)."""
+        return validated
+
+
+class EnumType(DeclarativeType):
+    """
+    Enumerated value type validator.
+
+    Accepts values from a predefined set of allowed values.
+
+    Parameters:
+    -----------
+    valid_values : t.Sequence[str]
+        List of allowed values (e.g., ["HASH", "RANDOM"])
+    normalized_type : t.Optional[str]
+        Target type for normalization:
+        - "str": Python string (default)
+        - "identifier": exp.Identifier
+        - "literal": exp.Literal.string()
+        - "column": exp.Column
+        - "ast_expr": generic exp.Expression (defaults to Identifier)
+    case_sensitive : bool
+        Whether to perform case-sensitive matching (default: False)
+
+    Validation: Checks if value is in allowed set, returns canonical string.
+    Normalization: Converts to specified target type.
+    """
+
+    def __init__(self, valid_values: t.Sequence[str], normalized_type: str = "str", case_sensitive: bool = False):
+        self.valid_values = list(valid_values)
+        self.case_sensitive = bool(case_sensitive)
+        self.normalized_type = normalized_type
+
+        if self.normalized_type is not None and self.normalized_type not in PROPERTY_OUTPUT_TYPES:
+            raise ValueError(
+                f"normalized_type must be one of {PROPERTY_OUTPUT_TYPES}, got {self.normalized_type!r}"
+            )
+
+        # Pre-compute normalized values for efficient lookup
+        self._values_normalized = [
+            v if case_sensitive else v.upper() for v in self.valid_values
+        ]
+
+    def _extract_text(self, value: t.Any) -> t.Optional[str]:
+        """Extract text from various value types."""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, exp.Literal):
+            # For Literal, this is the actual value
+            return str(value.this)
+        if isinstance(value, (exp.Identifier, exp.Column)):
+            # For Identifier/Column, this might be another Expression
+            if isinstance(value.this, str):
+                return value.this
+            elif hasattr(value.this, 'name'):  # noqa: RET505
+                return value.this.name
+            else:
+                return str(value.this)
+        return None
+
+    def _normalize_text(self, text: str) -> str:
+        """Normalize text for comparison based on case sensitivity."""
+        return text if self.case_sensitive else text.upper()
+
+    def validate(self, value: t.Any) -> t.Optional[str]:
+        """Check if value is in the allowed enum set. Returns canonical string or None."""
+        # Try parsing string first
+        if isinstance(value, str):
+            try:
+                parsed = parse_fragment(value)
+                # If parsed successfully, extract text from AST node
+                if isinstance(parsed, (exp.Identifier, exp.Literal, exp.Column)):
+                    value = parsed
+            except Exception:
+                # If parsing fails, treat as plain string
+                pass
+
+        # Extract text from value
+        text = self._extract_text(value)
+
+        if text is None:
+            return None
+
+        # Normalize and check against allowed values
+        normalized_text = self._normalize_text(text)
+        if normalized_text in self._values_normalized:
+            return normalized_text
+
+        return None
+
+    def normalize(self, validated: str) -> Normalized:
+        """Convert validated enum string to target type."""
+        # validated is already canonical (e.g., "HASH")
+        if self.normalized_type is None or self.normalized_type == "str":
+            return validated
+        if self.normalized_type == "literal":
+            return exp.Literal.string(validated)
+        if self.normalized_type == "identifier":
+            return exp.Identifier(this=validated)
+        if self.normalized_type == "column":
+            return exp.Column(this=validated)
+        if self.normalized_type == "ast_expr":
+            return exp.Identifier(this=validated)
+
+        # Fallback to string
+        return validated
+
+
+class FuncType(DeclarativeType):
+    """
+    Function type validator.
+
+    Accepts:
+    - exp.Func (built-in functions like date_trunc, CAST, etc.)
+    - exp.Anonymous (custom/dialect functions like RANGE, LIST)
+    - String that can be parsed as function call
+
+    Validation: Returns exp.Func or exp.Anonymous if valid, None otherwise.
+    Normalization: Returns the function expression as-is (identity).
+
+    Examples:
+        date_trunc('day', col1)     → exp.Func
+        RANGE(col1, col2)           → exp.Anonymous
+        LIST(region, status)        → exp.Anonymous
+    """
+
+    def validate(self, value: t.Any) -> t.Optional[t.Union[exp.Func, exp.Anonymous]]:
+        """Check if value is a function type. Returns exp.Func/exp.Anonymous or None."""
+        # Try parsing string first
+        if isinstance(value, str):
+            try:
+                value = parse_fragment(value)
+            except Exception:
+                return None
+
+        # Check if it's a Func or Anonymous function
+        if isinstance(value, (exp.Func, exp.Anonymous)):
+            return value
+
+        return None
+
+    def normalize(self, validated: t.Union[exp.Func, exp.Anonymous]) -> t.Union[exp.Func, exp.Anonymous]:
+        """Return function expression as-is (identity normalization)."""
+        return validated
+
+
+# ============================================================
+# AnyOf (combinator)
+# ============================================================
+class AnyOf(DeclarativeType):
+    """
+    Union type - accepts first matching sub-type.
+
+    This is a combinator type that tries each sub-type in order and accepts
+    the first one that validates successfully.
+
+    Validation: Tries each sub-type, returns (matched_type, validated_value) tuple.
+    Normalization: Uses the matched sub-type's normalize method.
+    """
+
+    def __init__(self, *types: DeclarativeType):
+        if not types:
+            raise ValueError("AnyOf requires at least one type")
+
+        # Validate all types are DeclarativeType instances
+        for t in types:
+            if not isinstance(t, DeclarativeType):
+                raise TypeError(f"AnyOf expects DeclarativeType instances, got {t!r}")
+
+        self.types: t.List[DeclarativeType] = list(types)
+
+    def validate(self, value: t.Any) -> t.Optional[t.Tuple[DeclarativeType, Validated]]:
+        """Try each sub-type in order, return (matched_type, validated_value) or None."""
+        for sub_type in self.types:
+            validated = sub_type.validate(value)
+            if validated is not None:
+                # Return both the matched type and validated value
+                return (sub_type, validated)
+
+        # No type matched
+        return None
+
+    def normalize(self, validated: t.Tuple[DeclarativeType, Validated]) -> Normalized:
+        """Normalize using the matched sub-type's normalize method."""
+        matched_type, validated_value = validated
+        return matched_type.normalize(validated_value)
+
+
+# ============================================================
+# SequenceOf (Tuple/List/Paren/Single -> normalized list)
+# ============================================================
+class SequenceOf(DeclarativeType):
+    """
+    Sequence/List type validator with built-in union type support.
+
+    Accepts various sequence representations and validates each element against
+    one or more possible types (similar to AnyOf for each element).
+    Optionally accepts single elements (promoted to single-item lists).
+
+    Accepts:
+    - exp.Tuple: (a, b, c)
+    - exp.Array: [a, b, c]
+    - exp.Paren: (a) or ((a, b))
+    - Python list/tuple: [a, b] or (a, b)
+    - String: "a, b, c" (parsed)
+    - Single element: a (if allow_single=True, promoted to [a])
+
+    Validation: Returns list of (matched_type, validated_value) tuples or None.
+    Normalization: Returns list of normalized elements using matched type's normalize.
+
+    Examples:
+        # Single type
+        SequenceOf(ColumnType())
+
+        # Multiple types (union) - each element tries types in order
+        SequenceOf(ColumnType(), IdentifierType(), LiteralType())
+
+        # Allow single element
+        SequenceOf(ColumnType(), allow_single=True)
+
+        # Multiple types + allow single
+        SequenceOf(ColumnType(), IdentifierType(), allow_single=True)
+    """
+
+    def __init__(self, *elem_types: DeclarativeType, allow_single: bool = False, output_as: str = "list"):
+        """
+        Args:
+            *elem_types: One or more type validators for elements.
+                        If multiple types provided, each element tries types in order (AnyOf behavior).
+            allow_single: Whether to accept single elements (promoted to list). Default: False.
+            output_as: Output format - "list" or "tuple". Default: "list".
+        """
+        if not elem_types:
+            raise ValueError("SequenceOf requires at least one element type")
+
+        self.elem_types: t.List[DeclarativeType] = list(elem_types)
+        self.allow_single = allow_single
+        self.output_as = output_as
+
+    def validate(self, value: t.Any) -> t.Optional[t.List[t.Tuple[DeclarativeType, Validated]]]:
+        """Validate each element in the sequence. Returns list of (matched_type, validated_value) tuples or None."""
+        # Extract elements from various container types
+        elems = self._extract_elements(value)
+        if elems is None:
+            return None
+
+        # Validate each element against all possible types (AnyOf behavior)
+        validated_items: t.List[t.Tuple[DeclarativeType, Validated]] = []
+        for elem in elems:
+            # Try each type until one matches
+            matched = False
+            for elem_type in self.elem_types:
+                validated = elem_type.validate(elem)
+                if validated is not None:
+                    validated_items.append((elem_type, validated))
+                    matched = True
+                    break
+
+            # If no type matched, the whole sequence fails if any element fails
+            if not matched:
+                return None
+
+        return validated_items
+
+    def normalize(self, validated: t.List[t.Tuple[DeclarativeType, Validated]]) -> t.Union[t.List[Normalized], t.Tuple[Normalized, ...]]:
+        """Normalize each validated element using its matched type's normalize method."""
+        normalized_items = [elem_type.normalize(value) for elem_type, value in validated]
+
+        # Convert to desired output format
+        if self.output_as == "tuple":
+            return tuple(normalized_items)
+        return normalized_items  # default: list
+
+    def _extract_elements(self, value: t.Any) -> t.Optional[t.List[t.Any]]:
+        """
+        Extract elements from various container representations.
+        Returns list of raw elements or None if extraction fails.
+        """
+        # Python list/tuple - process first before string parsing
+        if isinstance(value, (list, tuple)):
+            return list(value)
+
+        # Try parsing string for AST types
+        if isinstance(value, str):
+            try:
+                value = parse_fragment(value)
+            except Exception:
+                # If parsing fails and we accept single strings, promote to list
+                if self.allow_single and any(isinstance(t, StringType) for t in self.elem_types):
+                    return [value]
+                return None
+
+        # SQL Tuple: (a, b, c)
+        if isinstance(value, exp.Tuple):
+            return list(value.expressions)
+
+        # SQL Array: [a, b, c]
+        if isinstance(value, exp.Array):
+            return list(value.expressions)
+
+        # SQL Paren: (a) or ((a, b))
+        if isinstance(value, exp.Paren):
+            inner = value.this
+            if isinstance(inner, exp.Tuple):
+                return list(inner.expressions)
+            return [inner]
+
+        # Single AST element: promote to list (if allow_single)
+        if self.allow_single and isinstance(value, exp.Expression):
+            return [value]
+
+        return None
+
+
+# ============================================================
+# Field Definition for Structured Types
+# ============================================================
+class Field:
+    """
+    Field specification for StructuredTupleType.
+
+    Defines validation rules, types, and metadata for a single field.
+
+    Args:
+        type: DeclarativeType instance for validating field value
+        required: Whether this field is required (default: False)
+        aliases: List of alternative field names (default: [])
+        doc: Documentation string for this field
+
+    Example:
+        Field(
+            type=EnumType(["HASH", "RANDOM"]),
+            required=True,
+            aliases=["distribution_type"],
+            doc="Distribution kind: HASH or RANDOM"
+        )
+    """
+
+    def __init__(
+        self,
+        type: DeclarativeType,
+        required: bool = False,
+        aliases: t.Optional[t.List[str]] = None,
+        doc: t.Optional[str] = None
+    ):
+        self.type = type
+        self.required = required
+        self.aliases = aliases or []
+        self.doc = doc
+
+
+# ============================================================
+# StructuredTupleType - Base class for typed tuples
+# ============================================================
+class StructuredTupleType(DeclarativeType):
+    """
+    Base class for validating tuples with typed fields.
+
+    Subclasses define FIELDS dict to specify structure:
+
+    FIELDS = {
+        "field_name": Field(
+            type=SomeType(),
+            required=True,
+            aliases=["alt_name1", "alt_name2"]
+        ),
+        ...
+    }
+
+    Validation Process:
+    1. Parse tuple into key=value pairs (exp.EQ)
+    2. Match keys against FIELDS (including aliases)
+    3. Validate each field value with specified type
+    4. Check required fields are present
+    5. Handle unknown/invalid fields based on error flags
+
+    Returns: Dict[str, Any] with canonical field names as keys
+
+    Example:
+        class DistributionTupleType(StructuredTupleType):
+            FIELDS = {
+                "kind": Field(type=EnumType(["HASH", "RANDOM"]), required=True),
+                "columns": Field(type=SequenceOf(ColumnType())),
+            }
+
+    Args:
+        error_on_unknown_field: If True, raise error when encountering unknown fields.
+                                If False, silently skip unknown fields (default: False)
+        error_on_invalid_field: If True, raise error when field value validation fails.
+                                If False, return None for entire validation (default: True)
+    """
+
+    FIELDS: t.Dict[str, Field] = {}  # Subclasses override this
+
+    def __init__(self, error_on_unknown_field: bool = True, error_on_invalid_field: bool = True):
+        self.error_on_unknown_field = error_on_unknown_field
+        self.error_on_invalid_field = error_on_invalid_field
+
+        # Build alias mapping: alias -> canonical_name
+        self._alias_map: t.Dict[str, str] = {}
+        for field_name, field_spec in self.FIELDS.items():
+            # Map canonical name to itself
+            self._alias_map[field_name] = field_name
+            # Map aliases to canonical name
+            for alias in field_spec.aliases:
+                self._alias_map[alias] = field_name
+
+    def validate(self, value: t.Any) -> t.Optional[t.Dict[str, t.Tuple[DeclarativeType, Validated]]]:
+        """
+        Validate structured tuple.
+
+        Returns: Dict mapping canonical field names to (matched_type, validated_value) tuples,
+                 or None if validation fails.
+
+        Raises:
+            ValueError: If error_on_unknown_field=True and unknown field encountered
+            ValueError: If error_on_invalid_field=True and field validation fails
+        """
+        # Try parsing string first
+        if isinstance(value, str):
+            try:
+                value = parse_fragment(value)
+            except Exception:
+                return None
+
+        # Extract key=value pairs from tuple/paren
+        pairs = self._extract_pairs(value)
+        if pairs is None:
+            return None
+
+        # Validate each pair and build result dict
+        result: t.Dict[str, t.Tuple[DeclarativeType, Validated]] = {}
+        eq_type = EqType()
+
+        for pair_expr in pairs:
+            # Validate as EQ expression
+            eq_validated = eq_type.validate(pair_expr)
+            if eq_validated is None:
+                continue  # Skip non-EQ expressions
+
+            key, value_expr = eq_validated
+
+            # Resolve alias to canonical name
+            canonical_name = self._alias_map.get(key)
+            if canonical_name is None:
+                # Unknown field
+                if self.error_on_unknown_field:
+                    raise ValueError(
+                        f"Unknown field '{key}' in {self.__class__.__name__}. "
+                        f"Valid fields: {list(self.FIELDS.keys())}"
+                    )
+                # Skip unknown field
+                continue
+
+            # Get field spec
+            field_spec = self.FIELDS[canonical_name]
+
+            # Validate field value with specified type
+            validated_value = field_spec.type.validate(value_expr)
+            if validated_value is None:
+                # Field validation failed
+                if self.error_on_invalid_field:
+                    raise ValueError(
+                        f"Invalid value for field '{canonical_name}': {value_expr}. "
+                        f"Expected type: {field_spec.type.__class__.__name__}"
+                    )
+                # Return None for entire validation
+                return None
+
+            # Store with canonical name
+            result[canonical_name] = (field_spec.type, validated_value)
+
+        # Check required fields
+        for field_name, field_spec in self.FIELDS.items():
+            if field_spec.required and field_name not in result:
+                # Required field missing
+                if self.error_on_invalid_field:
+                    raise ValueError(
+                        f"Required field '{field_name}' is missing in {self.__class__.__name__}"
+                    )
+                return None
+
+        return result
+
+    def normalize(self, validated: t.Dict[str, t.Tuple[DeclarativeType, Validated]]) -> t.Dict[str, Normalized]:
+        """
+        Normalize validated fields.
+
+        Returns: Dict mapping canonical field names to normalized values.
+        """
+        return {
+            field_name: field_type.normalize(value)
+            for field_name, (field_type, value) in validated.items()
+        }
+
+    def _extract_pairs(self, value: t.Any) -> t.Optional[t.List[t.Any]]:
+        """
+        Extract list of expressions from tuple/paren.
+        Each expression should be an exp.EQ (key=value).
+        """
+        # exp.Tuple: (a=1, b=2)
+        if isinstance(value, (exp.Tuple, list)):
+            return list(value.expressions)
+
+        # exp.Paren: (a=1) or ((a=1, b=2))
+        if isinstance(value, exp.Paren):
+            inner = value.this
+            if isinstance(inner, exp.Tuple):
+                return list(inner.expressions)
+            return [inner]
+
+        return None
+
+
+class DistributionTupleType(StructuredTupleType):
+    """
+    StarRocks distribution tuple validator.
+
+    Accepts:
+    - (kind='HASH', columns=(id, dt), buckets=10)
+    - (kind='HASH', expressions=(id, dt), bucket_num=10)
+    - (kind='RANDOM')
+
+    Returns: Dict with fields:
+        - kind: "HASH" or "RANDOM" (string)
+        - columns: List[exp.Column] (optional, for HASH)
+        - buckets: exp.Literal (optional)
+
+    Field Aliases:
+        - columns: expressions
+        - buckets: bucket, bucket_num
+
+    Examples:
+        Input:  (kind='HASH', columns=(id, dt), buckets=10)
+        Output: {
+            'kind': 'HASH',
+            'columns': [exp.Column('id'), exp.Column('dt')],
+            'buckets': exp.Literal.number(10)
+        }
+
+        Input:  (kind='RANDOM')
+        Output: {'kind': 'RANDOM'}
+
+    Conversion:
+        Use factory methods to convert normalized values to unified dict format:
+        - from_enum(): Convert EnumType normalized value (str) → dict
+        - from_func(): Convert FuncType normalized value (exp.Func) → dict
+        - to_unified_dict(): Convert any normalized value → dict
+    """
+
+    FIELDS = {
+        "kind": Field(
+            type=EnumType(["HASH", "RANDOM"], normalized_type="str"),
+            required=True,
+            doc="Distribution type: HASH or RANDOM"
+        ),
+        "columns": Field(
+            type=SequenceOf(ColumnType(), IdentifierType(normalized_type="column")),
+            required=False,
+            aliases=["expressions"],
+            doc="Columns for HASH distribution"
+        ),
+        "buckets": Field(
+            type=AnyOf(LiteralType(), StringType()),
+            required=False,
+            aliases=["bucket", "bucket_num"],
+            doc="Number of buckets"
+        )
+    }
+
+    # ============================================================
+    # Factory methods for conversion from other normalized types
+    # ============================================================
+
+    @staticmethod
+    def from_enum(enum_value: str, buckets: t.Optional[int] = None) -> t.Dict[str, t.Any]:
+        """
+        Create distribution dict from EnumType normalized value.
+
+        Args:
+            enum_value: "RANDOM" (from EnumType)
+            buckets: Optional bucket count
+
+        Returns:
+            Dict with kind/columns/buckets fields
+
+        Example:
+            >>> DistributionTupleType.from_enum("RANDOM")
+            {"kind": "RANDOM", "columns": [], "buckets": None}
+        """
+        return {
+            "kind": enum_value,
+            "columns": [],
+            "buckets": buckets
+        }
+
+    @staticmethod
+    def from_func(func: t.Union[exp.Func, exp.Anonymous], buckets: t.Optional[int] = None) -> t.Dict[str, t.Any]:
+        """
+        Create distribution dict from FuncType normalized value.
+
+        Args:
+            func: HASH(id, dt) or RANDOM() (from FuncType)
+            buckets: Optional bucket count
+
+        Returns:
+            Dict with kind/columns/buckets fields
+
+        Example:
+            >>> func = parse_one("HASH(id, dt)")
+            >>> DistributionTupleType.from_func(func)
+            {"kind": "HASH", "columns": [exp.Column("id"), exp.Column("dt")], "buckets": None}
+        """
+        func_name = func.name.upper() if hasattr(func, 'name') else str(func.this).upper()
+
+        if func_name == "HASH":
+            # Extract columns from HASH(col1, col2, ...)
+            columns = list(func.args) if hasattr(func, 'args') else []
+            return {
+                "kind": "HASH",
+                "columns": columns,
+                "buckets": buckets
+            }
+        elif func_name == "RANDOM":  # noqa: RET505
+            return {
+                "kind": "RANDOM",
+                "columns": [],
+                "buckets": buckets
+            }
+        else:
+            raise ValueError(f"Unknown distribution function: {func_name}")
+
+    @staticmethod
+    def to_unified_dict(normalized_value: t.Any, buckets: t.Optional[t.Any] = None) -> t.Dict[str, t.Any]:
+        """
+        Convert any normalized distribution value to unified dict format.
+
+        This is a convenience method that dispatches to appropriate factory method.
+
+        Args:
+            normalized_value: Result from DistributedBySpec normalization
+                             (dict | str | exp.Func)
+            buckets: Optional bucket count override
+
+        Returns:
+            Unified dict with kind/columns/buckets fields
+
+        Raises:
+            TypeError: If value type is not supported
+
+        Example:
+            >>> # From DistributionTupleType
+            >>> DistributionTupleType.to_unified_dict({"kind": "HASH", "columns": [...]})
+            {"kind": "HASH", "columns": [...], "buckets": None}
+
+            >>> # From EnumType
+            >>> DistributionTupleType.to_unified_dict("RANDOM")
+            {"kind": "RANDOM", "columns": [], "buckets": None}
+
+            >>> # From FuncType
+            >>> DistributionTupleType.to_unified_dict(parse_one("HASH(id)"))
+            {"kind": "HASH", "columns": [exp.Column("id")], "buckets": None}
+        """
+        if isinstance(normalized_value, dict):
+            # Already in DistributionTupleType format
+            return normalized_value
+        elif isinstance(normalized_value, str):  # noqa: RET505
+            # From EnumType: "RANDOM"
+            return DistributionTupleType.from_enum(normalized_value, buckets)
+        elif isinstance(normalized_value, (exp.Func, exp.Anonymous)):
+            # From FuncType: HASH(id, dt)
+            return DistributionTupleType.from_func(normalized_value, buckets)
+        else:
+            raise TypeError(
+                f"Cannot convert {type(normalized_value).__name__} to distribution dict. "
+                f"Expected dict, str, or exp.Func/exp.Anonymous."
+            )
+
+
+# ============================================================
+# Type Specifications for StarRocks Properties
+# ============================================================
+
+class StarRocksPropertySpecs():
+
+    # Accepts:
+    # - Single column: id
+    # - Multiple columns: (id, dt)
+    GeneralColumnListInputSpec = SequenceOf(
+        ColumnType(),
+        StringType(normalized_type="column"),
+        IdentifierType(normalized_type="column"),
+        allow_single=True
+    )
+
+    # TableKey: Simple key specification (primary_key, duplicate_key, unique_key, aggregate_key)
+    # Accepts:
+    # - Single column: id
+    # - Multiple columns: (id, dt)
+    TableKeySpec = GeneralColumnListInputSpec
+
+    # Partitioned By: Flexible partition specification
+    # Accepts:
+    # - Single column: col1
+    # - Multiple columns: (col1, col2)
+    # - Mixed: (col1, "col2") - string will be parsed
+    # - RANGE(col1) or RANGE(col1, col2)
+    # - LIST(col1) or LIST(col1, col2)
+    # - Expression: (date_trunc('day', col1), col2)
+    PartitionedBySpec = SequenceOf(
+        ColumnType(),
+        StringType(normalized_type="column"),
+        IdentifierType(normalized_type="column"),
+        FuncType(),     # RANGE(), LIST(), date_trunc(), etc.
+        allow_single=True
+    )
+
+    # Partitions: List of partition definitions (strings)
+    # Accepts:
+    # - Single partition: 'PARTITION p1 VALUES LESS THAN ("2024-01-01")'
+    # - Multiple partitions: ('PARTITION p1 ...', 'PARTITION p2 ...')
+    # Note: Single string is auto-promoted to list
+    PartitionsSpec = SequenceOf(StringType(), allow_single=True)
+
+    # Distribution: StarRocks distribution specification
+    # Accepts:
+    # - Structured tuple1: (kind='HASH', columns=(id, dt), buckets=10)
+    # - Structured tuple2: (kind='RANDOM')
+    # - String format: "HASH(id)", "RANDOM", or "(kind='HASH', columns=(id), buckets=10)"
+    # Note: Does NOT accept simple columns like id or (id, dt)
+    #    And it can't directly accept "HASH(id) BUCKETS 10", you need to split it with "BUCKETS" to two parts.
+    DistributedBySpec = AnyOf(
+        DistributionTupleType(),  # Try structured tuple first (most specific)
+        EnumType(["RANDOM"], normalized_type="str"),  # "RANDOM"
+        FuncType(),  # "HASH(id)",
+    )
+
+    # OrderBy: Simple ordering specification
+    # Accepts:
+    # - Single column: dt
+    # - Multiple columns: (dt, id, status)
+    OrderBySpec = GeneralColumnListInputSpec
+
+    # Generic property value: Accepts various types, normalizes to string
+    # For properties like replication_num, storage_medium, etc.
+    # StarRocks PROPERTIES syntax requires all values to be strings: "value"
+    # So we normalize everything to string for consistent SQL generation
+    GenericPropertyType = AnyOf(
+        StringType(),     # Plain strings
+        LiteralType(normalized_type="str"),    # Numbers and string literals → will be converted to string
+        IdentifierType(normalized_type="str"), # Identifiers → will be converted to string
+    )
+
+    """
+    Input Property Specification for StarRocks
+
+    This specification defines the validation and normalization rules for StarRocks properties.
+    Properties are specified in the physical_properties block of a SQLMesh model.
+
+    Supported properties:
+    - partitioned_by / partition_by: Partition specification
+    - partitions: List of partition definitions
+    - distributed_by: Distribution specification (HASH/RANDOM with structured tuple or string)
+    - order_by: Ordering specification (simple column list)
+    - table key:
+        - primary_key: Primary key columns
+        - duplicate_key: Duplicate key columns (for DUPLICATE KEY table)
+        - unique_key: Unique key columns (for UNIQUE KEY table)
+        - aggregate_key: Aggregate key columns (for AGGREGATE KEY table)
+    - other properties: Any other properties not listed above will be treated as generic
+                        string properties (e.g., replication_num, storage_medium, etc.)
+
+    Examples:
+        duplicate_key = dt                             # Single key
+        primary_key = (id, customer_id)                # Multiple keys
+
+        partitioned_by = col1                          # Single column
+        partitioned_by = (col1, col2)                  # Multiple columns
+        partitioned_by = (col1, "col2")                # Mixed (string will be parsed)
+        partitioned_by = date_trunc('day', col1)       # Expression partition with single func
+        partitioned_by = (date_trunc('day', col1), col2)  # Expression partition with multiple exprs
+        partitioned_by = RANGE(col1, col2)             # RANGE partition
+        partitioned_by = LIST(region, status)          # LIST partition
+
+        distributed_by = (kind='HASH', columns=(id, dt), buckets=10)  # Structured
+        distributed_by = (kind='RANDOM')               # RANDOM distribution
+        distributed_by = "HASH(id)"                    # String format
+        distributed_by = "RANDOM"                      # String format
+
+        order_by = dt                                  # Single column
+        order_by = (dt, id, status)                    # Multiple columns
+
+        replication_num = 3                            # Generic property (auto-handled)
+        storage_medium = "SSD"                         # Generic property (auto-handled)
+    """
+    PROPERTY_INPUT_SPEC: t.Dict[str, DeclarativeType] = {
+        # Table key properties
+        "primary_key": TableKeySpec,
+        "duplicate_key": TableKeySpec,
+        "unique_key": TableKeySpec,
+        "aggregate_key": TableKeySpec,
+
+        # Partition-related properties
+        "partitioned_by": PartitionedBySpec,
+        # "partition_by": PartitionedBySpec,  # Alias for partitioned_by
+        "partitions": PartitionsSpec,
+
+        # Distribution property
+        "distributed_by": DistributedBySpec,
+
+        # Ordering property
+        "order_by": OrderBySpec,
+
+        # Note: All other properties not listed here will be handled
+        # by default GenericPropertyType (see get_property_input_type method)
+    }
+
+
+    GeneralColumnListOutputSpec = SequenceOf(ColumnType(), allow_single=False)
+
+    """
+    Output Property Specification for StarRocks after validation+normalization
+
+    This specification describes the expected types after normalization.
+    For most properties, OUTPUT spec is the same as INPUT spec since normalization
+    preserves the diverse types (dict | str | exp.Func for distribution).
+
+    Conversion to unified formats (e.g., all distributions → dict) happens separately
+    in the usage layer via factory methods like DistributionTupleType.to_unified_dict().
+
+    Expected Output Types (after normalization):
+    - table keys: List[exp.Expression] - columns
+    - partitioned_by: List[exp.Expression] - columns, functions
+    - partitions: List[str] - partition definition strings
+    - distributed_by: Dict | str | exp.Func - DistributionTupleType, EnumType, or FuncType output
+    - order_by: List[exp.Expression] - columns
+    - generic properties: str - normalized string values
+    """
+    PROPERTY_OUTPUT_SPEC: t.Dict[str, DeclarativeType] = {
+        "primary_key": GeneralColumnListOutputSpec,
+        "duplicate_key": GeneralColumnListOutputSpec,
+        "unique_key": GeneralColumnListOutputSpec,
+        "aggregate_key": GeneralColumnListOutputSpec,
+        "partitioned_by": SequenceOf(ColumnType(), FuncType(), allow_single=False),
+        "partitions": PartitionsSpec,
+        "distributed_by": DistributedBySpec,  # Still dict | str | exp.Func after normalize
+        "order_by": GeneralColumnListOutputSpec,
+        # Generic properties use GenericPropertyType
+    }
+
+
+    # ============================================================
+    # Helper functions
+    # ============================================================
+
+    @staticmethod
+    def get_property_input_type(property_name: str) -> DeclarativeType:
+        """
+        Get the INPUT type validator for a property.
+
+        Returns the specific type from PROPERTY_INPUT_SPEC if defined,
+        otherwise returns GenericPropertyType for unknown properties.
+
+        This allows any property not explicitly defined to be treated
+        as a generic string property.
+        """
+        return StarRocksPropertySpecs.PROPERTY_INPUT_SPEC.get(property_name, StarRocksPropertySpecs.GenericPropertyType)
+
+    @staticmethod
+    def get_property_output_type(property_name: str) -> DeclarativeType:
+        """
+        Get the OUTPUT type validator for a property.
+
+        Returns the specific type from PROPERTY_OUTPUT_SPEC if defined,
+        otherwise returns GenericPropertyType for unknown properties.
+
+        This allows validating that normalized values conform to expected output types.
+        """
+        return StarRocksPropertySpecs.PROPERTY_OUTPUT_SPEC.get(property_name, StarRocksPropertySpecs.GenericPropertyType)
+
+    @staticmethod
+    def validate_and_normalize_property(property_name: str, value: t.Any) -> t.Any:
+        """
+        Complete property processing pipeline:
+        1. Get INPUT type validator
+        2. Validate and normalize input value
+        3. Get OUTPUT type validator
+        4. Verify normalized output conforms to expected type
+        5. Return verified output
+
+        Raises:
+            ValueError: If validation fails
+
+        Example:
+            >>> validated = validate_and_normalize_property("distributed_by", "RANDOM")
+            >>> # Result: "RANDOM" (string from EnumType)
+            >>>
+            >>> validated = validate_and_normalize_property("distributed_by", "HASH(id)")
+            >>> # Result: exp.Func (from FuncType)
+        """
+        # Step 1: Get INPUT type validator
+        input_type = StarRocksPropertySpecs.get_property_input_type(property_name)
+
+        # Step 2: Validate
+        validated = input_type.validate(value)
+        if validated is None:
+            raise ValueError(
+                f"Invalid value for property '{property_name}': {value!r}. "
+                f"Expected type: {input_type.__class__.__name__}"
+            )
+
+        # Step 3: Normalize
+        normalized = input_type.normalize(validated)
+
+        # Step 4: Return
+        return normalized
+
+
+###############################################################################
 @set_catalog()
 class StarRocksEngineAdapter(
     LogicalMergeMixin,
