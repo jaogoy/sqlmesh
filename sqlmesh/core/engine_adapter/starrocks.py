@@ -21,6 +21,7 @@ from sqlmesh.core.engine_adapter.shared import (
     set_catalog,
     to_schema,
 )
+from sqlmesh.core.node import IntervalUnit
 from sqlmesh.utils.errors import SQLMeshError
 
 if t.TYPE_CHECKING:
@@ -1262,9 +1263,11 @@ class PropertyValidator:
     and ensure consistent error messages across different property handlers.
     """
 
+    TABLE_KEY_TYPES = {"primary_key", "duplicate_key", "unique_key", "aggregate_key"}
+
     # All important properties except generic properties
     IMPORTANT_PROPERTY_NAMES = {
-        "primary_key", "duplicate_key", "unique_key", "aggregate_key",
+        *TABLE_KEY_TYPES,
         "partitioned_by", "partitions",
         "distributed_by",
         "clustered_by"
@@ -1279,7 +1282,7 @@ class PropertyValidator:
 
     # Centralized invalid property name configuration
     # Maps canonical name -> list of invalid/deprecated names
-    INVALID_PROPERTY_NAMES: t.Dict[str, t.List[str]] = {
+    INVALID_PROPERTY_NAME_MAP: t.Dict[str, t.List[str]] = {
         "partitioned_by": ["partition"],
         "distributed_by": ["distribution", "distribute"],
         "clustered_by": ["order", "ordering"],
@@ -1419,7 +1422,7 @@ class PropertyValidator:
     @classmethod
     def check_all_invalid_names(cls, table_properties: t.Dict[str, t.Any]) -> None:
         """
-        Check all invalid property names at once using INVALID_PROPERTY_NAMES config.
+        Check all invalid property names at once using INVALID_PROPERTY_NAME_MAP config.
 
         Args:
             table_properties: Table properties dictionary to check
@@ -1427,26 +1430,27 @@ class PropertyValidator:
         Raises:
             SQLMeshError: If any invalid name is found
         """
-        for valid_name, invalid_names in cls.INVALID_PROPERTY_NAMES.items():
+        for valid_name, invalid_names in cls.INVALID_PROPERTY_NAME_MAP.items():
             cls.check_invalid_names(valid_name, invalid_names, table_properties)
 
     @staticmethod
     def check_at_most_one(
-        property_group_name: str,
-        property_names: t.List[str],
+        property_name: str,
+        property_description: str,
+        property_names: t.Sequence[str],
         table_properties: t.Dict[str, t.Any],
         parameter_value: t.Optional[t.Any] = None,
-        parameter_name: t.Optional[str] = None
     ) -> t.Optional[str]:
         """
         Ensure at most one property from a mutually exclusive group is defined.
 
         Args:
-            property_group_name: Name of the property group (for error messages)
-            property_names: List of mutually exclusive property names
+            property_name: the canonical name
+            property_description: description of the property group (for error messages)
+            property_names: List of mutually exclusive property names.
+                Defaults to canonical name and aliases if not provided.
             table_properties: Table properties dictionary to check
             parameter_value: Optional parameter value (takes priority over table_properties)
-            parameter_name: Optional parameter name (for error messages)
 
         Returns:
             Name of the active property, or None if none found
@@ -1457,23 +1461,26 @@ class PropertyValidator:
 
         Example:
             >>> PropertyValidator.check_at_most_one(
-            ...     property_group_name="key type",
+            ...     property_name="primary_key",
+            ...     property_description="key type",
             ...     property_names=["primary_key", "duplicate_key", "unique_key", "aggregate_key"],
             ...     table_properties={"primary_key": "(id)", "duplicate_key": "(id)"}
             ... )
             SQLMeshError: Multiple key type properties defined: ['primary_key', 'duplicate_key'].
                          Only one is allowed.
         """
+        if not property_names:
+            property_names = PROPERTY_ALIASES.get(property_name, []) + [property_name]
         # Check parameter first (highest priority)
         if parameter_value is not None:
             # Check if any conflicting properties exist in table_properties
             conflicts = [name for name in property_names if name in table_properties]
             if conflicts:
-                param_display = parameter_name or "parameter"
+                param_display = f"{property_name} (parameter)"
                 raise SQLMeshError(
-                    f"Conflicting {property_group_name} definitions: "
+                    f"Conflicting {property_description} definitions: "
                     f"{param_display} provided along with table_properties {conflicts}. "
-                    f"Only one {property_group_name} is allowed."
+                    f"Only one {property_description} is allowed."
                 )
             return None
 
@@ -1482,7 +1489,7 @@ class PropertyValidator:
 
         if len(present) > 1:
             raise SQLMeshError(
-                f"Multiple {property_group_name} properties defined: {present}. "
+                f"Multiple {property_description} properties defined: {present}. "
                 f"Only one is allowed."
             )
 
@@ -1824,296 +1831,6 @@ class StarRocksEngineAdapter(
         )
 
     # ==================== Table Creation (CORE IMPLEMENTATION) ====================
-
-
-
-
-    def _build_table_properties_exp(
-        self,
-        catalog_name: t.Optional[str] = None,
-        table_format: t.Optional[str] = None,
-        storage_format: t.Optional[str] = None,
-        partitioned_by: t.Optional[t.List[exp.Expression]] = None,
-        partition_interval_unit: t.Optional["IntervalUnit"] = None,
-        clustered_by: t.Optional[t.List[exp.Expression]] = None,
-        table_properties: t.Optional[t.Dict[str, t.Any]] = None,
-        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
-        table_description: t.Optional[str] = None,
-        table_kind: t.Optional[str] = None,
-        **kwargs: t.Any,
-    ) -> t.Optional[exp.Properties]:
-        """
-        Build table properties for StarRocks CREATE TABLE statement.
-
-        Handles:
-        - Table comment
-        - Partition expressions (RANGE/LIST/EXPRESSION)
-        - Distribution (HASH/RANDOM)
-        - Order by (clustering)
-        - Other properties (replication_num, storage_medium, etc.)
-
-        Args:
-            clustered_by: Clustering columns (generates ORDER BY clause)
-            table_properties: Dictionary containing:
-                - duplicate_key: Tuple/list of column names for DUPLICATE KEY
-                - aggregate_key: Tuple/list of column names for AGGREGATE KEY
-                - unique_key: Tuple/list of column names for UNIQUE KEY
-                - distributed_by: Tuple of EQ expressions (kind, expressions, buckets)
-                - partitions: Tuple of partition definition strings
-                - order_by: Alias for clustered_by (backward compatibility)
-                - replication_num, storage_medium, etc.: Literal values
-        """
-        properties: t.List[exp.Expression] = []
-        table_properties_copy = dict(table_properties) if table_properties else {}
-
-        # 1. Add table comment
-        if table_description:
-            properties.append(
-                exp.SchemaCommentProperty(
-                    this=exp.Literal.string(self._truncate_table_comment(table_description))
-                )
-            )
-
-        # 2. Handle key constraints (DUPLICATE KEY, AGGREGATE KEY, UNIQUE KEY)
-        # Note: PRIMARY KEY is handled by base class via primary_key parameter
-        self._add_key_properties(properties, table_properties_copy)
-
-        # 3. Handle partitioned_by (PARTITION BY RANGE/LIST/EXPRESSION)
-        partition_prop = self._build_partition_property(
-            partitioned_by, partition_interval_unit, target_columns_to_types, catalog_name
-        )
-        if partition_prop:
-            properties.append(partition_prop)
-
-        # 4. Handle distributed_by (DISTRIBUTED BY HASH/RANDOM)
-        distributed_prop = self._build_distribution_property(table_properties_copy)
-        if distributed_prop:
-            properties.append(distributed_prop)
-
-        # 5. Handle order_by/clustered_by (ORDER BY ...)
-        order_prop = self._build_order_by_property(table_properties_copy, clustered_by)
-        if order_prop:
-            properties.append(order_prop)
-
-        # 6. Handle other properties (replication_num, storage_medium, etc.)
-        other_props = self._build_other_properties(table_properties_copy)
-        properties.extend(other_props)
-
-        return exp.Properties(expressions=properties) if properties else None
-
-    def _add_key_properties(
-        self,
-        properties: t.List[exp.Expression],
-        table_properties: t.Dict[str, t.Any]
-    ) -> None:
-        """
-        Add key constraint properties (DUPLICATE KEY, AGGREGATE KEY, UNIQUE KEY) to the properties list.
-
-        Note: PRIMARY KEY is handled by base class via primary_key parameter.
-
-        Args:
-            properties: List to append key properties to
-            table_properties: Dictionary containing key definitions (will be modified)
-        """
-        # Handle DUPLICATE KEY
-        duplicate_key = table_properties.pop("duplicate_key", None)
-        if duplicate_key is not None:
-            key_columns = self._expr_to_column_tuple(duplicate_key)
-            properties.append(
-                exp.DuplicateKeyProperty(
-                    expressions=[exp.to_column(col) for col in key_columns]
-                )
-            )
-
-        # Handle UNIQUE KEY (legacy, prefer PRIMARY KEY in StarRocks 3.0+)
-        unique_key = table_properties.pop("unique_key", None)
-        if unique_key is not None:
-            key_columns = self._expr_to_column_tuple(unique_key)
-            properties.append(
-                exp.UniqueKeyProperty(
-                    expressions=[exp.to_column(col) for col in key_columns]
-                )
-            )
-
-        # Note: AGGREGATE KEY not implemented yet - requires column aggregation functions
-
-    def _build_partition_property(
-        self,
-        partitioned_by: t.Optional[t.List[exp.Expression]],
-        partition_interval_unit: t.Optional["IntervalUnit"],
-        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
-        catalog_name: t.Optional[str]
-    ) -> t.Optional[exp.Expression]:
-        """
-        Build partition property expression.
-
-        StarRocks supports:
-        - PARTITION BY RANGE (cols) - for time-based partitions
-        - PARTITION BY LIST (cols) - for categorical partitions
-        - PARTITION BY (exprs) - for expression partitions
-        - PARTITION BY exprs - for expression partitions, without `(`, `)`
-
-        Args:
-            partitioned_by: Partition column expressions
-            partition_interval_unit: Optional time unit for automatic partitioning
-            target_columns_to_types: Column definitions
-            catalog_name: Catalog name (if applicable)
-
-        Returns:
-            Partition property expression or None
-        """
-        if not partitioned_by:
-            return None
-
-        # Use base class implementation if available
-        return self._build_partitioned_by_exp(
-            partitioned_by,
-            partition_interval_unit=partition_interval_unit,
-            target_columns_to_types=target_columns_to_types,
-            catalog_name=catalog_name,
-        )
-
-    def _build_distribution_property(
-        self,
-        table_properties: t.Dict[str, t.Any]
-    ) -> t.Optional[exp.DistributedByProperty]:
-        """
-        Build DISTRIBUTED BY property from table_properties.
-
-        Supports:
-        - DISTRIBUTED BY HASH (col1, col2, ...) BUCKETS n
-        - DISTRIBUTED BY RANDOM
-
-        Args:
-            table_properties: Dictionary containing distributed_by (will be modified)
-
-        Returns:
-            DistributedByProperty or None
-        """
-        distributed_by = table_properties.pop("distributed_by", None)
-        if distributed_by is None:
-            return None
-
-        # Parse the Tuple of EQ expressions
-        distributed_info = {}
-        # like: (kind = 'HASH', expressions = 'id', buckets = 8)
-        if isinstance(distributed_by, exp.Tuple):
-            for expr in distributed_by.expressions:
-                if isinstance(expr, exp.EQ) and hasattr(expr.this, "this"):
-                    # Remove quotes from the key if present
-                    key = str(expr.this.this).strip('"')
-                    # string style distribution value
-                    if isinstance(expr.expression, exp.Literal):
-                        distributed_info[key] = expr.expression.this
-                    # a single column, a tuple of columns. converted to a list of column names
-                    elif isinstance(expr.expression, exp.Column):
-                        distributed_info[key] = [expr.expression.name]
-                    elif isinstance(expr.expression, exp.Tuple):
-                        distributed_info[key] = [
-                            e.name if isinstance(e, exp.Column) else str(e)
-                            for e in expr.expression.expressions
-                        ]
-                    else:
-                        distributed_info[key] = expr.expression
-
-        # Build DistributedByProperty
-        if distributed_info:
-            kind = str(distributed_info.get("kind", "RANDOM"))
-            expressions = distributed_info.get("expressions", [])
-            if not isinstance(expressions, list):
-                expressions = [expressions] if expressions else []
-
-            buckets = distributed_info.get("buckets")
-
-            return exp.DistributedByProperty(
-                kind=exp.Var(this=kind),
-                expressions=[
-                    exp.to_column(e) if not isinstance(e, exp.Expression) else e
-                    for e in expressions
-                ],
-                buckets=exp.Literal.number(int(buckets)) if buckets else None,
-                order=None,
-            )
-
-        return None
-
-    def _build_order_by_property(
-        self,
-        table_properties: t.Dict[str, t.Any],
-        clustered_by: t.Optional[t.List[exp.Expression]]
-    ) -> t.Optional[exp.Cluster]:
-        """
-        Build ORDER BY (clustering) property.
-
-        Supports both:
-        - clustered_by parameter (from create_table call)
-        - order_by in table_properties (backward compatibility alias)
-
-        Priority: clustered_by parameter > order_by in table_properties
-
-        Args:
-            table_properties: Dictionary containing optional order_by (will be modified)
-            clustered_by: Clustering columns from parameter
-
-        Returns:
-            Cluster expression (generates ORDER BY) or None
-        """
-        # Support order_by as an alias for clustered_by
-        order_by = table_properties.pop("order_by", None)
-        if order_by is not None and clustered_by is None:
-            # Convert order_by to clustered_by format
-            if isinstance(order_by, exp.Tuple):
-                clustered_by = order_by.expressions
-            elif isinstance(order_by, (list, tuple)):
-                clustered_by = [
-                    exp.to_column(col) if not isinstance(col, exp.Expression) else col
-                    for col in order_by
-                ]
-            elif isinstance(order_by, exp.Column):
-                clustered_by = [order_by]
-            elif isinstance(order_by, str):
-                clustered_by = [exp.to_column(order_by)]
-
-        if clustered_by:
-            return exp.Cluster(expressions=clustered_by)
-
-        return None
-
-    def _build_other_properties(
-        self,
-        table_properties: t.Dict[str, t.Any]
-    ) -> t.List[exp.Property]:
-        """
-        Build other literal properties (replication_num, storage_medium, etc.).
-
-        Args:
-            table_properties: Dictionary containing properties (will be modified)
-
-        Returns:
-            List of Property expressions
-        """
-        other_props = []
-        for key, value in list(table_properties.items()):
-            # Skip special keys handled elsewhere
-            if key in ("partitions", "duplicate_key", "unique_key", "aggregate_key",
-                      "distributed_by", "order_by"):
-                continue
-
-            # Convert value to Property
-            if isinstance(value, exp.Literal):
-                other_props.append(
-                    exp.Property(this=exp.to_identifier(key), value=value)
-                )
-            elif isinstance(value, (str, int, float)):
-                other_props.append(
-                    exp.Property(
-                        this=exp.to_identifier(key),
-                        value=exp.Literal.string(str(value))
-                    )
-                )
-
-        return other_props
-
     def _create_table_from_columns(
         self,
         table_name: TableName,
@@ -2127,9 +1844,10 @@ class StarRocksEngineAdapter(
         """
         Create a table using column definitions.
 
-        StarRocks Supports PRIMARY KEY natively
+        StarRocks Supports PRIMARY KEY, it will pass the `primary_key` into table_properties
+        for unified handling in `_build_key_propety`
           CREATE TABLE t (id INT) PRIMARY KEY(id)
-          → Extract primary_key from table_properties and pass to base class
+          → Will also extract primary_key from table_properties and pass to base class
 
         StarRocks Key Column Ordering Constraint:
         ALL key types (PRIMARY KEY, UNIQUE KEY, DUPLICATE KEY, AGGREGATE KEY) require:
@@ -2179,22 +1897,19 @@ class StarRocksEngineAdapter(
         table_properties = kwargs.setdefault("table_properties", {})
 
         # Extract and validate key columns from table_properties
-        # Priority: parameter primary_key > table_properties
+        # Priority: parameter primary_key > table_properties (already handled above)
         key_type, key_columns = self._extract_and_validate_key_columns(
             table_properties, primary_key
         )
 
+        # IMPORTANT: Normalize parameter primary_key into table_properties for unified handling
+        # This ensures _build_table_properties_exp() can access primary_key even when
+        # it's passed as a model parameter rather than in physical_properties
+        if primary_key:
+            table_properties["primary_key"] = primary_key
         # Update primary_key based on extracted key type
         if key_type == "primary_key":
             primary_key = key_columns
-        elif key_type in ("unique_key", "duplicate_key", "aggregate_key"):
-            # For other key types, columns still need reordering but handled differently
-            # These will be processed by _build_table_properties_exp()
-            primary_key = None  # Don't generate PRIMARY KEY clause
-        else:
-            # No key defined
-            primary_key = None
-            key_columns = None
 
         # StarRocks key column ordering constraint: All key types need reordering
         if key_columns:
@@ -2213,6 +1928,541 @@ class StarRocksEngineAdapter(
             **kwargs,
         )
 
+    def _build_table_properties_exp(
+        self,
+        catalog_name: t.Optional[str] = None,
+        table_format: t.Optional[str] = None,
+        storage_format: t.Optional[str] = None,
+        partitioned_by: t.Optional[t.List[exp.Expression]] = None,
+        partition_interval_unit: t.Optional[IntervalUnit] = None,
+        clustered_by: t.Optional[t.List[exp.Expression]] = None,
+        table_properties: t.Optional[t.Dict[str, t.Any]] = None,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        table_description: t.Optional[str] = None,
+        table_kind: t.Optional[str] = None,
+        **kwargs: t.Any,
+    ) -> t.Optional[exp.Properties]:
+        """
+        Build table properties for StarRocks CREATE TABLE statement.
+
+        Handles:
+        - Key constraints (PRIMARY KEY, DUPLICATE KEY, UNIQUE KEY) - PRIMARY KEY will be set by base class
+        - Partition expressions (RANGE/LIST/EXPRESSION)
+        - Distribution (HASH/RANDOM)
+        - Order by (clustering)
+        - Table comment
+        - Other properties (replication_num, storage_medium, etc.)
+
+        Args:
+            clustered_by: Clustering columns (generates ORDER BY clause)
+            table_properties: Dictionary containing:
+                - duplicate_key/ggregate_key/unique_key: Tuple/list of column names
+                - distributed_by: Tuple of EQ expressions (kind, expressions, buckets) or string
+                - partitioned_by/partitions: List of Column or Functions. Tuple of partition definition strings
+                - clustered_by(order_by): List of Column
+                - replication_num, storage_medium, etc.: Literal values
+        """
+        properties: t.List[exp.Expression] = []
+        table_properties_copy = dict(table_properties) if table_properties else {}
+
+        # Validate all property names at once
+        PropertyValidator.check_all_invalid_names(table_properties_copy)
+
+        # Check for mutually exclusive key types
+        # Note: primary_key is already set into table_properties if model param is set
+        active_key_type = PropertyValidator.check_at_most_one(
+            property_name="key_type",
+            property_description="key type",
+            property_names=PropertyValidator.TABLE_KEY_TYPES,
+            table_properties=table_properties_copy,
+        )
+
+        # 1. Extract key columns for partition/distribution validation (read-only, don't pop yet)
+        key_type, key_columns = None, None
+        if active_key_type:
+            key_type = active_key_type
+            key_expr = table_properties_copy[key_type]
+            # Use validate_and_normalize_property to get List[exp.Column], then extract names
+            normalized = PropertyValidator.validate_and_normalize_property(
+                key_type, key_expr, preprocess_parentheses=True
+            )
+            key_columns = tuple(col.name for col in normalized)
+
+        # 2. Handle key constraints
+        key_prop = self._build_table_key_property(table_properties_copy, active_key_type)
+        if key_prop:
+            properties.append(key_prop)
+
+        # 3. Handle partitioned_by (PARTITION BY RANGE/LIST/EXPRESSION)
+        partition_prop = self._build_partition_property(
+            partitioned_by, partition_interval_unit, target_columns_to_types,
+            catalog_name, table_properties_copy, key_type, key_columns
+        )
+        if partition_prop:
+            properties.append(partition_prop)
+
+        # 4. Handle distributed_by (DISTRIBUTED BY HASH/RANDOM)
+        distributed_prop = self._build_distributed_by_property(table_properties_copy, key_columns)
+        if distributed_prop:
+            properties.append(distributed_prop)
+
+        # 5. Handle order_by/clustered_by (ORDER BY ...)
+        order_prop = self._build_order_by_property(table_properties_copy, clustered_by)
+        if order_prop:
+            properties.append(order_prop)
+
+        # 6. Add table comment
+        if table_description:
+            properties.append(
+                exp.SchemaCommentProperty(
+                    this=exp.Literal.string(self._truncate_table_comment(table_description))
+                )
+            )
+
+        # 7. Handle other properties (replication_num, storage_medium, etc.)
+        other_props = self._build_other_properties(table_properties_copy)
+        properties.extend(other_props)
+
+        return exp.Properties(expressions=properties) if properties else None
+
+    def _build_table_key_property(
+        self,
+        table_properties: t.Dict[str, t.Any],
+        active_key_type: t.Optional[str]
+    ) -> t.Optional[exp.Expression]:
+        """
+        Build key constraint property (PRIMARY KEY, DUPLICATE KEY, UNIQUE KEY, AGGREGATE KEY).
+
+        Args:
+            table_properties: Dictionary containing key definitions (will be modified)
+            active_key_type: The active key type or None
+
+        Returns:
+            Key property expression, or None if no key defined
+        """
+        if not active_key_type:
+            return None
+
+        # Configuration: key_name -> Property class
+        KEY_PROPERTY_CLASSES: t.Dict[str, t.Type[exp.Expression]] = {
+            "primary_key": exp.PrimaryKey,
+            "duplicate_key": exp.DuplicateKeyProperty,
+            "unique_key": exp.UniqueKeyProperty,
+            # "aggregate_key": exp.AggregateKeyProperty,  # Not implemented yet
+        }
+
+        property_class = KEY_PROPERTY_CLASSES.get(active_key_type)
+        key_value = table_properties.pop(active_key_type, None)
+        if not property_class:
+            # Unknown key type (e.g., aggregate_key not implemented yet)
+            logger.warning(f"[StarRocks] Unknown key type: {active_key_type}")
+            return None
+        if key_value is None:
+            logger.error(f"Failed to get the parameter value for {active_key_type!r}")
+            return None
+
+        # Validate and normalize
+        # preprocess_parentheses=True handles string preprocessing like 'id, dt' -> '(id, dt)'
+        normalized = PropertyValidator.validate_and_normalize_property(
+            active_key_type,
+            key_value,
+            preprocess_parentheses=True
+        )
+        # normalized is List[exp.Column] as defined in TableKeyInputSpec
+        return property_class(expressions=list(normalized))
+
+    def _build_partition_property(
+        self,
+        partitioned_by: t.Optional[t.List[exp.Expression]],
+        partition_interval_unit: t.Optional["IntervalUnit"],
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
+        catalog_name: t.Optional[str],
+        table_properties: t.Dict[str, t.Any],
+        key_type: t.Optional[str],
+        key_columns: t.Optional[t.Tuple[str, ...]]
+    ) -> t.Optional[exp.Expression]:
+        """
+        Build partition property expression.
+
+        StarRocks supports:
+        - PARTITION BY RANGE (cols) - for time-based partitions
+        - PARTITION BY LIST (cols) - for categorical partitions
+        - PARTITION BY (exprs) - for expression partitions, can also be `exprs` (without `(`, and `)`)
+
+        Args:
+            partitioned_by: Partition column expressions from parameter
+            partition_interval_unit: Optional time unit for automatic partitioning
+            target_columns_to_types: Column definitions
+            catalog_name: Catalog name (if applicable)
+            table_properties: Dictionary containing partitioned_by/partitions (will be modified)
+            key_type: Table key type (for validation)
+            key_columns: Table key columns (partition columns must be subset)
+
+        Returns:
+            Partition property expression or None
+        """
+        # Priority: parameter > partition_by (alias) > partitioned_by
+        # Use PropertyValidator to check mutual exclusion between parameter and properties
+        partition_param_name = PropertyValidator.check_at_most_one(
+            property_name="partitioned_by",
+            property_description="partition definition",
+            table_properties=table_properties,
+            parameter_value=partitioned_by,
+        )
+
+        # If parameter was provided, it takes priority
+        if partitioned_by is None and partition_param_name:
+            # Get from table_properties
+            partitioned_by = table_properties.pop(partition_param_name, None)
+
+        if not partitioned_by:
+            return None
+
+        # Parse partition expressions to extract columns and kind (RANGE/LIST)
+        partition_kind, partition_cols = self._parse_partition_expressions(partitioned_by)
+
+        def extract_column_name(expr: exp.Expression) -> str:
+            if isinstance(expr, exp.Column):
+                return str(expr.name)
+            elif isinstance(expr, (exp.Anonymous, exp.Func)):  # noqa: RET505
+                return str(expr)  # not implemented
+            else:
+                return str(expr)
+
+        # Validate partition columns are in key columns (StarRocks requirement)
+        if key_columns:
+            partition_col_names = [extract_column_name(expr) for expr in partition_cols]
+            key_cols_set = set(key_columns)
+            not_in_key = partition_col_names - key_cols_set
+            if not_in_key:
+                logger.warning(
+                    f"[StarRocks] Partition columns {not_in_key} not in {key_type} columns {key_cols_set}. "
+                    "StarRocks requires partition columns to be part of the table key."
+                )
+
+        # Get partition definitions (RANGE/LIST partitions)
+        partitions = table_properties.pop("partitions", None)
+
+        # Build partition expression using base class method
+        return self._build_partitioned_by_exp(
+            partition_cols,
+            partition_interval_unit=partition_interval_unit,
+            target_columns_to_types=target_columns_to_types,
+            catalog_name=catalog_name,
+            partitions=partitions,
+            partition_kind=partition_kind,
+        )
+
+    def _parse_partition_expressions(
+        self, partitioned_by: t.List[exp.Expression]
+    ) -> t.Tuple[t.Optional[str], t.List[exp.Expression]]:
+        """
+        Parse partition expressions and extract partition kind (RANGE/LIST).
+
+        Uses PartitionedByInputSpec to validate and normalize the entire list,
+        then extracts RANGE/LIST kind from function expressions.
+
+        The SPEC output is List[exp.Column | exp.Anonymous | exp.Func], where:
+        - exp.Column: Regular column reference
+        - exp.Anonymous: Function call like RANGE(col), LIST(col), and other datetime related functions
+        - exp.Func: date_trunc(), and other built-in functions
+
+        Args:
+            partitioned_by: List of partition expressions
+
+        Returns:
+            Tuple of (partition_kind, normalized_columns)
+            - partition_kind: "RANGE", "LIST", or None
+            - normalized_columns: List of Column expressions, or function expressions
+        """
+        parsed_cols: t.List[exp.Expression] = []
+        partition_kind: t.Optional[str] = None
+
+        normalized = PropertyValidator.validate_and_normalize_property("partitioned_by", partitioned_by)
+        # Process each normalized expression
+        for norm_expr in normalized:
+            # Check if it's a RANGE function (exp.Anonymous)
+            if isinstance(norm_expr, exp.Anonymous) and norm_expr.this:
+                func_name = str(norm_expr.this).upper()
+                if func_name in ("RANGE", "LIST"):
+                    partition_kind = func_name
+                    # Extract column expressions from function arguments
+                    for arg in norm_expr.expressions:
+                        if isinstance(arg, exp.Column):
+                            parsed_cols.append(arg)
+                        else:
+                            parsed_cols.append(exp.to_column(str(arg)))
+                    continue
+
+            # Check if it's a LIST expression (SQLGlot parses LIST(...) as exp.List)
+            if isinstance(norm_expr, exp.List):
+                partition_kind = "LIST"
+                # Extract column expressions from list items
+                for item in norm_expr.expressions:
+                    if isinstance(item, exp.Column):
+                        parsed_cols.append(item)
+                    else:
+                        parsed_cols.append(exp.to_column(str(item)))
+                continue
+
+            # Regular column or other function (date_trunc, etc.)
+            parsed_cols.append(norm_expr)
+
+        return partition_kind, parsed_cols
+
+    def _build_partitioned_by_exp(
+        self,
+        partitioned_by: t.List[exp.Expression],
+        *,
+        partition_interval_unit: t.Optional["IntervalUnit"] = None,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        catalog_name: t.Optional[str] = None,
+        **kwargs: t.Any,
+    ) -> t.Optional[
+        t.Union[
+            exp.PartitionedByProperty,
+            exp.PartitionByRangeProperty,
+            exp.PartitionByListProperty,
+            exp.Property,
+        ]
+    ]:
+        """
+        Build StarRocks partitioning expression.
+
+        - partition_kind: RANGE/LIST/None (passed via kwargs, None as expression partitioning)
+        - partitioned_by: normalized partition column/func/anonymous expressions
+        - partitions: partition definitions as List[str] (passed via kwargs)
+
+        Supports both RANGE and LIST partition syntaxes, and expression partition syntax.
+
+        Args:
+            partitioned_by: List of partition column expressions
+            partition_interval_unit: Optional time unit (unused for now)
+            target_columns_to_types: Column definitions (unused for now)
+            catalog_name: Catalog name (unused for now)
+            **kwargs: Must contain 'partition_kind' and optionally 'partitions'
+
+        Returns:
+            PartitionByRangeProperty, PartitionByListProperty, or None
+        """
+        partition_kind = kwargs.get("partition_kind")
+        partitions: t.Optional[t.List[str]] = kwargs.get("partitions")
+
+        # Process partitions to create_expressions
+        # partitions is already List[str] after SPEC normalization
+        create_expressions: t.Optional[t.List[exp.Var]] = None
+        if partitions:
+            create_expressions = [exp.Var(this=p, quoted=False) for p in partitions]
+
+        # Build partition expression
+        if partition_kind == "LIST":
+            return exp.PartitionByListProperty(
+                partition_expressions=partitioned_by,
+                create_expressions=create_expressions,
+            )
+        elif partition_kind == "RANGE":  # noqa: RET505
+            return exp.PartitionByRangeProperty(
+                partition_expressions=partitioned_by,
+                create_expressions=create_expressions,
+            )
+        elif partition_kind is None:
+            return exp.PartitionedByProperty(partition_expressions=partitioned_by)
+
+    def _build_distributed_by_property(
+        self,
+        table_properties: t.Dict[str, t.Any],
+        key_columns: t.Optional[t.Tuple[str, ...]]
+    ) -> t.Optional[exp.DistributedByProperty]:
+        """
+        Build DISTRIBUTED BY property from table_properties.
+
+        Supports:
+        1. Structured tuple: (kind='HASH', columns=(id, dt), buckets=10)
+        2. String format: "HASH(id)", "RANDOM", "HASH(id) BUCKETS 10"
+        3. None: Returns None (no default distribution)
+
+        For complex string like "HASH(id) BUCKETS 10", uses split-and-combine:
+        - Split on 'BUCKETS' to separate HASH part and bucket count
+        - Parse HASH part via DistributedByInputSpec
+        - Parse bucket count as number
+        - Combine into unified dict
+
+        Args:
+            table_properties: Dictionary containing distributed_by (will be modified)
+            key_columns: Table key columns (used for default distribution)
+
+        Returns:
+            DistributedByProperty or None
+        """
+        distributed_by = table_properties.pop("distributed_by", None)
+
+        # No default - if not set, return None
+        if distributed_by is None:
+            return None
+
+        # Try to parse complex string with BUCKETS first
+        unified = self._parse_distribution_with_buckets(distributed_by)
+        if unified is None:
+            # Fall back to SPEC-based parsing
+            normalized = PropertyValidator.validate_and_normalize_property("distributed_by", distributed_by)
+            # Convert to unified dict format
+            unified = DistributionTupleInputType.to_unified_dict(normalized)
+
+        # Build expression
+        kind_expr = exp.Var(this=unified["kind"])
+        # Convert columns to expressions
+        columns: t.List[exp.Column] = unified.get("columns", [])
+        expressions_list: t.List[exp.Expression] = []
+        for col in columns:
+            if isinstance(col, exp.Expression):
+                expressions_list.append(col)
+            else:
+                expressions_list.append(exp.to_column(str(col)))
+        # Build buckets expression
+        buckets: t.Optional[exp.Literal] = unified.get("buckets")
+        buckets_expr: t.Optional[exp.Expression] = exp.Literal.number(int(buckets)) if buckets else None
+
+        return exp.DistributedByProperty(
+            kind=kind_expr,
+            expressions=expressions_list,
+            buckets=buckets_expr,
+            order=None,
+        )
+
+    def _parse_distribution_with_buckets(
+        self,
+        distributed_by: t.Any
+    ) -> t.Optional[t.Dict[str, t.Any]]:
+        """
+        Parse complex distribution expressions like 'HASH(id) BUCKETS 10'.
+
+        Since SQLGlot cannot parse 'HASH(id) BUCKETS 10' directly, we:
+        1. Detect if input is a string containing 'BUCKETS'
+        2. Split into HASH part and BUCKETS part
+        3. Parse HASH part via DistributedByInputSpec
+        4. Extract bucket count as number
+        5. Combine into unified dict
+
+        Args:
+            distributed_by: The distribution value (may be string, expression, etc.)
+
+        Returns:
+            Unified dict with keys: kind, columns, buckets
+            Returns None if not a complex BUCKETS expression
+            (The output function will still handle "HASH(id)" without BUCKETS)
+        """
+        import re
+
+        # Only handle string or Literal string values
+        if isinstance(distributed_by, str):
+            text = distributed_by
+        elif isinstance(distributed_by, exp.Literal) and distributed_by.is_string:
+            text = str(distributed_by.this)
+        else:
+            return None
+
+        # Check if contains BUCKETS keyword (case-insensitive)
+        if "BUCKETS" not in text.upper():
+            return None
+
+        # Split on BUCKETS (case-insensitive)
+        match = re.match(r"^(.+?)\s+BUCKETS\s+(\d+)\s*$", text.strip(), flags=re.IGNORECASE)
+        if not match:
+            return None
+
+        hash_part = match.group(1).strip()
+        buckets_str = match.group(2)
+
+        # Parse the HASH/RANDOM part via SPEC
+        normalized = PropertyValidator.validate_and_normalize_property("distributed_by", hash_part)
+
+        return DistributionTupleInputType.to_unified_dict(normalized, int(buckets_str))
+
+    def _build_order_by_property(
+        self,
+        table_properties: t.Dict[str, t.Any],
+        clustered_by: t.Optional[t.List[exp.Expression]]
+    ) -> t.Optional[exp.Cluster]:
+        """
+        Build ORDER BY (clustering) property.
+
+        Supports both:
+        - clustered_by parameter (from create_table call)
+        - order_by in table_properties (backward compatibility alias)
+
+        Priority: clustered_by parameter > order_by in table_properties
+
+        Args:
+            table_properties: Dictionary containing optional order_by (will be modified)
+            clustered_by: Clustering columns from parameter
+
+        Returns:
+            Cluster expression (generates ORDER BY) or None
+        """
+        # Priority: clustered_by parameter > order_by in table_properties
+        # Use PropertyValidator to check mutual exclusion between parameter and property
+        order_by_param_name = PropertyValidator.check_at_most_one(
+            property_name="clustered_by",
+            property_description="clustering definition",
+            table_properties=table_properties,
+            parameter_value=clustered_by,
+        )
+
+        # If parameter was provided, it takes priority
+        if clustered_by is None and order_by_param_name:
+            # Get order_by from table_properties (already validated by check_at_most_one)
+            order_by = table_properties.pop(order_by_param_name, None)
+            if order_by is not None:
+                normalized = PropertyValidator.validate_and_normalize_property("clustered_by", order_by)
+                clustered_by = list(normalized)
+
+        if clustered_by:
+            return exp.Cluster(expressions=clustered_by)
+        else:  # noqa: RET505
+            return None
+
+    def _build_other_properties(
+        self,
+        table_properties: t.Dict[str, t.Any]
+    ) -> t.List[exp.Property]:
+        """
+        Build other literal properties (replication_num, storage_medium, etc.).
+
+        Uses validate_and_normalize_property for validation and ensures output is string,
+        as StarRocks PROPERTIES syntax requires all values to be strings.
+
+        Args:
+            table_properties: Dictionary containing properties (will be modified)
+
+        Returns:
+            List of Property expressions
+        """
+        other_props = []
+
+        for key, value in list(table_properties.items()):
+            # Skip special keys handled elsewhere
+            if key in PropertyValidator.IMPORTANT_PROPERTY_NAMES:
+                logger.warning(f"{key!r} should have been processed already. Check the logic, but will skip it again.")
+                continue
+
+            # Remove from properties
+            table_properties.pop(key)
+
+            # Validate and normalize to string
+            # All other properties are treated as generic string properties
+            try:
+                normalized = PropertyValidator.validate_and_normalize_property(key, value)
+                other_props.append(
+                    exp.Property(
+                        this=exp.to_identifier(key),
+                        value=exp.Literal.string(str(normalized))
+                    )
+                )
+            except SQLMeshError as e:
+                logger.warning(f"[StarRocks] Skipping property {key}: {e}")
+
+        return other_props
+
     def _extract_and_validate_key_columns(
         self,
         table_properties: t.Dict[str, t.Any],
@@ -2220,12 +2470,6 @@ class StarRocksEngineAdapter(
     ) -> t.Tuple[t.Optional[str], t.Optional[t.Tuple[str, ...]]]:
         """
         Extract and validate key columns from table_properties.
-
-        StarRocks Table Types and Key Requirements:
-        1. PRIMARY KEY table - primary_key property (StarRocks 3.0+)
-        2. UNIQUE KEY table - unique_key property (legacy, replacable by PK)
-        3. DUPLICATE KEY table - duplicate_key property
-        4. AGGREGATE KEY table - aggregate_key property
 
         All key types require:
         - Key columns must be the first N columns in CREATE TABLE
@@ -2247,87 +2491,33 @@ class StarRocksEngineAdapter(
         Raises:
             SQLMeshError: If multiple key types are defined or column extraction fails
         """
-        # Check which key types are present (keys are lowercase in table_properties)
-        key_types_present = []
-        for key_type in ["primary_key", "unique_key", "duplicate_key", "aggregate_key"]:
-            if key_type in table_properties:
-                key_types_present.append(key_type)
+        # Use PropertyValidator to check mutual exclusion
+        active_key_type = PropertyValidator.check_at_most_one(
+            property_description="StarRocks table type",
+            property_names=PropertyValidator.TABLE_KEY_TYPES,
+            table_properties=table_properties,
+            parameter_value=primary_key,
+        )
 
-        # Validate only one key type in table_properties
-        if len(key_types_present) > 1:
-            raise SQLMeshError(
-                f"Multiple key types defined in table_properties: {key_types_present}. "
-                "Only one key type is allowed per table."
-            )
-
-        # Priority: parameter primary_key > table_properties
+        # If parameter primary_key was provided, return it
         if primary_key:
-            # If parameter is provided and table_properties also has a key, warn
-            if key_types_present:
-                logger.warning(
-                    f"Both parameter primary_key and table_properties {key_types_present[0]} "
-                    f"are defined. Parameter primary_key takes priority: {primary_key}"
-                )
-                # Remove from table_properties to avoid duplicate (only for primary_key parameter case)
-                table_properties.pop(key_types_present[0], None)
             return ("primary_key", primary_key)
 
         # Extract from table_properties
-        if not key_types_present:
+        if not active_key_type:
             return (None, None)
 
-        # For other 3 table types
-        key_type = key_types_present[0]
-        key_expr = table_properties[key_type]  # Read without popping - needed later!
+        # Get the key expression and normalize via SPEC
+        key_expr = table_properties[active_key_type]  # Read without popping
+        # Use validate_and_normalize_property to get List[exp.Column], then extract names
+        normalized = PropertyValidator.validate_and_normalize_property(
+            active_key_type, key_expr, preprocess_parentheses=True
+        )
+        key_columns = tuple(col.name for col in normalized)
 
-        # Convert expression to tuple of column names
-        key_columns = self._expr_to_column_tuple(key_expr)
+        logger.debug(f"Extracted {active_key_type} from table_properties: {key_columns}")
 
-        logger.info(f"Extracted {key_type} from table_properties: {key_columns}")
-
-        return (key_type, key_columns)
-
-    def _expr_to_column_tuple(
-        self, expr: t.Any
-    ) -> t.Tuple[str, ...]:
-        """
-        Convert various expression types to tuple of column names.
-
-        Handles:
-        - exp.Tuple: Tuple of Column expressions
-        - list/tuple: List of Column expressions or strings
-        - exp.Column: Single column
-        - str: Single column name
-
-        Args:
-            expr: Expression to convert
-
-        Returns:
-            Tuple of column names
-
-        Raises:
-            SQLMeshError: If expression type is unsupported
-        """
-        if isinstance(expr, exp.Tuple):
-            # exp.Tuple with Column expressions
-            return tuple(col.name for col in expr.expressions)
-        elif isinstance(expr, (list, tuple)):  # noqa: RET505
-            # List/tuple of expressions or strings
-            return tuple(
-                col.name if isinstance(col, exp.Column) else str(col)
-                for col in expr
-            )
-        elif isinstance(expr, exp.Column):
-            # Single column
-            return (expr.name,)
-        elif isinstance(expr, str):
-            # Single column name as string
-            return (expr,)
-        else:
-            raise SQLMeshError(
-                f"Unsupported key column expression type: {type(expr)}. "
-                f"Expected exp.Tuple, list, tuple, exp.Column, or str."
-            )
+        return (active_key_type, key_columns)
 
     def _reorder_columns_for_key(
         self,
