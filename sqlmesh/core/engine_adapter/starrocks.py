@@ -728,7 +728,7 @@ class StructuredTupleType(DeclarativeType):
     Returns: Dict[str, Any] with canonical field names as keys
 
     Example:
-        class DistributionTupleType(StructuredTupleType):
+        class DistributionTupleInputType(StructuredTupleType):
             FIELDS = {
                 "kind": Field(type=EnumType(["HASH", "RANDOM"]), required=True),
                 "columns": Field(type=SequenceOf(ColumnType())),
@@ -863,7 +863,7 @@ class StructuredTupleType(DeclarativeType):
         return None
 
 
-class DistributionTupleType(StructuredTupleType):
+class DistributionTupleInputType(StructuredTupleType):
     """
     StarRocks distribution tuple validator.
 
@@ -912,10 +912,26 @@ class DistributionTupleType(StructuredTupleType):
             doc="Columns for HASH distribution"
         ),
         "buckets": Field(
-            type=AnyOf(LiteralType(), StringType()),
+            type=AnyOf(LiteralType(), StringType(normalized_type="literal")),
             required=False,
             aliases=["bucket", "bucket_num"],
             doc="Number of buckets"
+        )
+    }
+
+class DistributionTupleOutputType(StructuredTupleType):
+    FIELDS = {
+        "kind": Field(
+            type=EnumType(["HASH", "RANDOM"], normalized_type="str"),
+            required=True,
+        ),
+        "columns": Field(
+            type=SequenceOf(ColumnType()),
+            required=False,
+        ),
+        "buckets": Field(
+            type=AnyOf(LiteralType()),
+            required=False,
         )
     }
 
@@ -936,7 +952,7 @@ class DistributionTupleType(StructuredTupleType):
             Dict with kind/columns/buckets fields
 
         Example:
-            >>> DistributionTupleType.from_enum("RANDOM")
+            >>> DistributionTupleInputType.from_enum("RANDOM")
             {"kind": "RANDOM", "columns": [], "buckets": None}
         """
         return {
@@ -959,14 +975,14 @@ class DistributionTupleType(StructuredTupleType):
 
         Example:
             >>> func = parse_one("HASH(id, dt)")
-            >>> DistributionTupleType.from_func(func)
+            >>> DistributionTupleInputType.from_func(func)
             {"kind": "HASH", "columns": [exp.Column("id"), exp.Column("dt")], "buckets": None}
         """
         func_name = func.name.upper() if hasattr(func, 'name') else str(func.this).upper()
 
         if func_name == "HASH":
             # Extract columns from HASH(col1, col2, ...)
-            columns = list(func.args) if hasattr(func, 'args') else []
+            columns: list[exp.Column] = list(func.args) if hasattr(func, 'args') else []
             return {
                 "kind": "HASH",
                 "columns": columns,
@@ -982,14 +998,14 @@ class DistributionTupleType(StructuredTupleType):
             raise ValueError(f"Unknown distribution function: {func_name}")
 
     @staticmethod
-    def to_unified_dict(normalized_value: t.Any, buckets: t.Optional[t.Any] = None) -> t.Dict[str, t.Any]:
+    def to_unified_dict(normalized_value: t.Any, buckets: t.Optional[int] = None) -> t.Dict[str, t.Any]:
         """
         Convert any normalized distribution value to unified dict format.
 
         This is a convenience method that dispatches to appropriate factory method.
 
         Args:
-            normalized_value: Result from DistributedBySpec normalization
+            normalized_value: Result from DistributedByInputSpec normalization
                              (dict | str | exp.Func)
             buckets: Optional bucket count override
 
@@ -1000,27 +1016,27 @@ class DistributionTupleType(StructuredTupleType):
             TypeError: If value type is not supported
 
         Example:
-            >>> # From DistributionTupleType
-            >>> DistributionTupleType.to_unified_dict({"kind": "HASH", "columns": [...]})
+            >>> # From DistributionTupleInputType
+            >>> DistributionTupleInputType.to_unified_dict({"kind": "HASH", "columns": [...]})
             {"kind": "HASH", "columns": [...], "buckets": None}
 
             >>> # From EnumType
-            >>> DistributionTupleType.to_unified_dict("RANDOM")
+            >>> DistributionTupleInputType.to_unified_dict("RANDOM")
             {"kind": "RANDOM", "columns": [], "buckets": None}
 
             >>> # From FuncType
-            >>> DistributionTupleType.to_unified_dict(parse_one("HASH(id)"))
+            >>> DistributionTupleInputType.to_unified_dict(parse_one("HASH(id)"))
             {"kind": "HASH", "columns": [exp.Column("id")], "buckets": None}
         """
         if isinstance(normalized_value, dict):
-            # Already in DistributionTupleType format
+            # Already in DistributionTupleInputType format
             return normalized_value
         elif isinstance(normalized_value, str):  # noqa: RET505
             # From EnumType: "RANDOM"
-            return DistributionTupleType.from_enum(normalized_value, buckets)
+            return DistributionTupleInputType.from_enum(normalized_value, buckets)
         elif isinstance(normalized_value, (exp.Func, exp.Anonymous)):
             # From FuncType: HASH(id, dt)
-            return DistributionTupleType.from_func(normalized_value, buckets)
+            return DistributionTupleInputType.from_func(normalized_value, buckets)
         else:
             raise TypeError(
                 f"Cannot convert {type(normalized_value).__name__} to distribution dict. "
@@ -1032,7 +1048,7 @@ class DistributionTupleType(StructuredTupleType):
 # Type Specifications for StarRocks Properties
 # ============================================================
 
-class StarRocksPropertySpecs():
+class PropertySpecs():
 
     # Accepts:
     # - Single column: id
@@ -1048,7 +1064,7 @@ class StarRocksPropertySpecs():
     # Accepts:
     # - Single column: id
     # - Multiple columns: (id, dt)
-    TableKeySpec = GeneralColumnListInputSpec
+    TableKeyInputSpec = GeneralColumnListInputSpec
 
     # Partitioned By: Flexible partition specification
     # Accepts:
@@ -1058,7 +1074,7 @@ class StarRocksPropertySpecs():
     # - RANGE(col1) or RANGE(col1, col2)
     # - LIST(col1) or LIST(col1, col2)
     # - Expression: (date_trunc('day', col1), col2)
-    PartitionedBySpec = SequenceOf(
+    PartitionedByInputSpec = SequenceOf(
         ColumnType(),
         StringType(normalized_type="column"),
         IdentifierType(normalized_type="column"),
@@ -1071,7 +1087,7 @@ class StarRocksPropertySpecs():
     # - Single partition: 'PARTITION p1 VALUES LESS THAN ("2024-01-01")'
     # - Multiple partitions: ('PARTITION p1 ...', 'PARTITION p2 ...')
     # Note: Single string is auto-promoted to list
-    PartitionsSpec = SequenceOf(StringType(), allow_single=True)
+    PartitionsInputSpec = SequenceOf(StringType(), allow_single=True)
 
     # Distribution: StarRocks distribution specification
     # Accepts:
@@ -1080,8 +1096,8 @@ class StarRocksPropertySpecs():
     # - String format: "HASH(id)", "RANDOM", or "(kind='HASH', columns=(id), buckets=10)"
     # Note: Does NOT accept simple columns like id or (id, dt)
     #    And it can't directly accept "HASH(id) BUCKETS 10", you need to split it with "BUCKETS" to two parts.
-    DistributedBySpec = AnyOf(
-        DistributionTupleType(),  # Try structured tuple first (most specific)
+    DistributedByInputSpec = AnyOf(
+        DistributionTupleInputType(),  # Try structured tuple first (most specific)
         EnumType(["RANDOM"], normalized_type="str"),  # "RANDOM"
         FuncType(),  # "HASH(id)",
     )
@@ -1090,13 +1106,13 @@ class StarRocksPropertySpecs():
     # Accepts:
     # - Single column: dt
     # - Multiple columns: (dt, id, status)
-    OrderBySpec = GeneralColumnListInputSpec
+    OrderByInputSpec = GeneralColumnListInputSpec
 
     # Generic property value: Accepts various types, normalizes to string
     # For properties like replication_num, storage_medium, etc.
     # StarRocks PROPERTIES syntax requires all values to be strings: "value"
     # So we normalize everything to string for consistent SQL generation
-    GenericPropertyType = AnyOf(
+    GenericPropertyInputSpec = AnyOf(
         StringType(),     # Plain strings
         LiteralType(normalized_type="str"),    # Numbers and string literals → will be converted to string
         IdentifierType(normalized_type="str"), # Identifiers → will be converted to string
@@ -1144,30 +1160,30 @@ class StarRocksPropertySpecs():
         replication_num = 3                            # Generic property (auto-handled)
         storage_medium = "SSD"                         # Generic property (auto-handled)
     """
-    PROPERTY_INPUT_SPEC: t.Dict[str, DeclarativeType] = {
+    PROPERTY_INPUT_SPECS: t.Dict[str, DeclarativeType] = {
         # Table key properties
-        "primary_key": TableKeySpec,
-        "duplicate_key": TableKeySpec,
-        "unique_key": TableKeySpec,
-        "aggregate_key": TableKeySpec,
+        "primary_key": TableKeyInputSpec,
+        "duplicate_key": TableKeyInputSpec,
+        "unique_key": TableKeyInputSpec,
+        "aggregate_key": TableKeyInputSpec,
 
         # Partition-related properties
-        "partitioned_by": PartitionedBySpec,
-        # "partition_by": PartitionedBySpec,  # Alias for partitioned_by
-        "partitions": PartitionsSpec,
+        "partitioned_by": PartitionedByInputSpec,
+        "partitions": PartitionsInputSpec,
 
         # Distribution property
-        "distributed_by": DistributedBySpec,
+        "distributed_by": DistributedByInputSpec,
 
         # Ordering property
-        "order_by": OrderBySpec,
+        "order_by": OrderByInputSpec,
 
-        # Note: All other properties not listed here will be handled
-        # by default GenericPropertyType (see get_property_input_type method)
+        # Note: All other properties not listed here will be handled, an example here
+        "replication_num": GenericPropertyInputSpec,
     }
 
 
-    GeneralColumnListOutputSpec = SequenceOf(ColumnType(), allow_single=False)
+    # Default output spec for properties not in PROPERTY_OUTPUT_SPECS
+    GenericPropertyOutputSpec = StringType()
 
     """
     Output Property Specification for StarRocks after validation+normalization
@@ -1177,26 +1193,31 @@ class StarRocksPropertySpecs():
     preserves the diverse types (dict | str | exp.Func for distribution).
 
     Conversion to unified formats (e.g., all distributions → dict) happens separately
-    in the usage layer via factory methods like DistributionTupleType.to_unified_dict().
+    in the usage layer via factory methods like DistributionTupleInputType.to_unified_dict().
 
     Expected Output Types (after normalization):
     - table keys: List[exp.Expression] - columns
     - partitioned_by: List[exp.Expression] - columns, functions
     - partitions: List[str] - partition definition strings
-    - distributed_by: Dict | str | exp.Func - DistributionTupleType, EnumType, or FuncType output
+    - distributed_by: Dict | str | exp.Func - DistributionTupleInputType, EnumType, or FuncType output
     - order_by: List[exp.Expression] - columns
     - generic properties: str - normalized string values
     """
-    PROPERTY_OUTPUT_SPEC: t.Dict[str, DeclarativeType] = {
-        "primary_key": GeneralColumnListOutputSpec,
+    PROPERTY_OUTPUT_SPECS: t.Dict[str, DeclarativeType] = {
+        "primary_key": (GeneralColumnListOutputSpec := SequenceOf(ColumnType(), allow_single=False)),
         "duplicate_key": GeneralColumnListOutputSpec,
         "unique_key": GeneralColumnListOutputSpec,
         "aggregate_key": GeneralColumnListOutputSpec,
         "partitioned_by": SequenceOf(ColumnType(), FuncType(), allow_single=False),
-        "partitions": PartitionsSpec,
-        "distributed_by": DistributedBySpec,  # Still dict | str | exp.Func after normalize
+        "partitions": PartitionsInputSpec,  # The same as PartitionsInputSpec
+        "distributed_by": AnyOf(
+            DistributionTupleOutputType(),  # Try structured tuple first (most specific)
+            EnumType(["RANDOM"]),  # "RANDOM"
+            FuncType(),  # "HASH(id)",
+        ),  # Still dict | str | exp.Func after normalize
         "order_by": GeneralColumnListOutputSpec,
-        # Generic properties use GenericPropertyType
+        # Generic properties use GenericPropertyOutputSpec, an example here
+        "replication_num": GenericPropertyOutputSpec,
     }
 
 
@@ -1205,68 +1226,271 @@ class StarRocksPropertySpecs():
     # ============================================================
 
     @staticmethod
-    def get_property_input_type(property_name: str) -> DeclarativeType:
+    def get_property_input_spec(property_name: str) -> DeclarativeType:
         """
         Get the INPUT type validator for a property.
 
-        Returns the specific type from PROPERTY_INPUT_SPEC if defined,
-        otherwise returns GenericPropertyType for unknown properties.
+        Returns the specific type from PROPERTY_INPUT_SPECS if defined,
+        otherwise returns GenericPropertyInputSpec for unknown properties.
 
         This allows any property not explicitly defined to be treated
         as a generic string property.
         """
-        return StarRocksPropertySpecs.PROPERTY_INPUT_SPEC.get(property_name, StarRocksPropertySpecs.GenericPropertyType)
+        return PropertySpecs.PROPERTY_INPUT_SPECS.get(property_name, PropertySpecs.GenericPropertyInputSpec)
 
     @staticmethod
-    def get_property_output_type(property_name: str) -> DeclarativeType:
+    def get_property_output_spec(property_name: str) -> DeclarativeType:
         """
         Get the OUTPUT type validator for a property.
 
-        Returns the specific type from PROPERTY_OUTPUT_SPEC if defined,
-        otherwise returns GenericPropertyType for unknown properties.
+        Returns the specific type from PROPERTY_OUTPUT_SPECS if defined,
+        otherwise returns GenericPropertyOutputSpec for unknown properties.
 
         This allows validating that normalized values conform to expected output types.
         """
-        return StarRocksPropertySpecs.PROPERTY_OUTPUT_SPEC.get(property_name, StarRocksPropertySpecs.GenericPropertyType)
+        return PropertySpecs.PROPERTY_OUTPUT_SPECS.get(property_name, PropertySpecs.GenericPropertyOutputSpec)
+
+
+# ============================================================
+# Property Validation Helpers
+# ============================================================
+class PropertyValidator:
+    """
+    Centralized property validation helpers for table properties.
+
+    Provides reusable validation functions to avoid code duplication
+    and ensure consistent error messages across different property handlers.
+    """
+
+    # All important properties except generic properties
+    IMPORTANT_PROPERTY_NAMES = {
+        "primary_key", "duplicate_key", "unique_key", "aggregate_key",
+        "partitioned_by", "partitions",
+        "distributed_by",
+        "clustered_by"
+    }
+
+    # Centralized property alias configuration
+    # Maps canonical name -> list of valid aliases
+    PROPERTY_ALIASES: t.Dict[str, t.List[str]] = {
+        "partitioned_by": ["partition_by"],
+        "clustered_by": ["order_by"],
+    }
+
+    # Centralized invalid property name configuration
+    # Maps canonical name -> list of invalid/deprecated names
+    INVALID_PROPERTY_NAMES: t.Dict[str, t.List[str]] = {
+        "partitioned_by": ["partition"],
+        "distributed_by": ["distribution", "distribute"],
+        "clustered_by": ["order", "ordering"],
+    }
 
     @staticmethod
-    def validate_and_normalize_property(property_name: str, value: t.Any) -> t.Any:
+    def ensure_parenthesized(value: t.Any) -> t.Any:
         """
-        Complete property processing pipeline:
-        1. Get INPUT type validator
-        2. Validate and normalize input value
-        3. Get OUTPUT type validator
-        4. Verify normalized output conforms to expected type
-        5. Return verified output
+        Ensure string value is wrapped in parentheses for parse_fragment compatibility.
 
-        Raises:
-            ValueError: If validation fails
+        For string inputs like 'id1, id2', wraps to '(id1, id2)' so that
+        parse_fragment can parse it correctly.
+
+        Args:
+            value: Input value (string, expression, or other)
+
+        Returns:
+            - For strings: wrapped in parentheses if not already
+            - For other types: returned unchanged
 
         Example:
-            >>> validated = validate_and_normalize_property("distributed_by", "RANDOM")
-            >>> # Result: "RANDOM" (string from EnumType)
-            >>>
-            >>> validated = validate_and_normalize_property("distributed_by", "HASH(id)")
-            >>> # Result: exp.Func (from FuncType)
+            >>> PropertyValidator.ensure_parenthesized('id1, id2')
+            '(id1, id2)'
+            >>> PropertyValidator.ensure_parenthesized('(id1, id2)')
+            '(id1, id2)'
         """
-        # Step 1: Get INPUT type validator
-        input_type = StarRocksPropertySpecs.get_property_input_type(property_name)
+        if not isinstance(value, str):
+            return value
 
-        # Step 2: Validate
-        validated = input_type.validate(value)
+        stripped = value.strip()
+        if not stripped:
+            return value
+
+        # Check if already wrapped in parentheses
+        if stripped.startswith('(') and stripped.endswith(')'):
+            return value
+
+        return f'({stripped})'
+
+    @staticmethod
+    def validate_and_normalize_property(
+        property_name: str,
+        value: t.Any,
+        preprocess_parentheses: bool = False
+    ) -> t.Any:
+        """
+        Complete property processing pipeline using SPEC:
+        1. Optionally preprocess string with parentheses
+        2. Get INPUT type validator
+        3. Validate and normalize input value
+        4. Get OUTPUT type validator
+        5. Verify normalized output conforms to expected type
+        6. Return verified output
+
+        After validation, the output type is guaranteed by SPEC.
+        Unexpected types indicate SPEC configuration errors.
+
+        Args:
+            property_name: Name of the property
+            value: The property value to validate
+            preprocess_parentheses: If True, wrap string values in parentheses
+
+        Returns:
+            The normalized value
+
+        Raises:
+            SQLMeshError: If validation fails
+
+        Example:
+            >>> validated = PropertyValidator.validate_and_normalize_property("distributed_by", "RANDOM")
+            >>> # Result: "RANDOM" (string from EnumType)
+        """
+        # Step 1: Optionally preprocess string with parentheses
+        if preprocess_parentheses:
+            value = PropertyValidator.ensure_parenthesized(value)
+
+        # Step 2: Get INPUT type validator
+        input_spec = PropertySpecs.get_property_input_spec(property_name)
+        if input_spec is None:
+            raise SQLMeshError(f"Unknown property '{property_name}'.")
+
+        # Step 3: Validate
+        validated = input_spec.validate(value)
         if validated is None:
-            raise ValueError(
-                f"Invalid value for property '{property_name}': {value!r}. "
-                f"Expected type: {input_type.__class__.__name__}"
+            raise SQLMeshError(
+                f"Invalid value for property '{property_name}': {value!r}."
             )
 
-        # Step 3: Normalize
-        normalized = input_type.normalize(validated)
+        # Step 4: Normalize
+        normalized = input_spec.normalize(validated)
 
-        # Step 4: Return
+        # Step 5: Check by using output spec
+        output_spec = PropertySpecs.get_property_output_spec(property_name)
+        if output_spec is not None:
+            if output_spec.validate(normalized) is None:
+                raise SQLMeshError(
+                    f"Normalized value for property '{property_name}' doesn't match output spec: {normalized!r}."
+                )
+
+        # Step 6: Return
         return normalized
 
+    @staticmethod
+    def check_invalid_names(
+        valid_name: str,
+        invalid_names: t.List[str],
+        table_properties: t.Dict[str, t.Any],
+        suggestion: t.Optional[str] = None
+    ) -> None:
+        """
+        Check for invalid/deprecated property names and raise error with suggestion.
 
+        Args:
+            valid_name: The correct property name
+            invalid_names: List of invalid/deprecated names to check for
+            table_properties: Table properties dictionary to check
+            suggestion: Optional custom error message suggestion
+
+        Raises:
+            SQLMeshError: If any invalid name is found
+
+        Example:
+            >>> PropertyValidator.check_invalid_names(
+            ...     valid_name="partitioned_by",
+            ...     invalid_names=["partition_by", "partition"],
+            ...     table_properties={"partition_by": "dt"}
+            ... )
+            SQLMeshError: Invalid property 'partition_by'. Use 'partitioned_by' instead.
+        """
+        for invalid_name in invalid_names:
+            if invalid_name in table_properties:
+                msg = suggestion or f"Use '{valid_name}' instead"
+                raise SQLMeshError(
+                    f"Invalid property '{invalid_name}'. {msg}."
+                )
+
+    @classmethod
+    def check_all_invalid_names(cls, table_properties: t.Dict[str, t.Any]) -> None:
+        """
+        Check all invalid property names at once using INVALID_PROPERTY_NAMES config.
+
+        Args:
+            table_properties: Table properties dictionary to check
+
+        Raises:
+            SQLMeshError: If any invalid name is found
+        """
+        for valid_name, invalid_names in cls.INVALID_PROPERTY_NAMES.items():
+            cls.check_invalid_names(valid_name, invalid_names, table_properties)
+
+    @staticmethod
+    def check_at_most_one(
+        property_group_name: str,
+        property_names: t.List[str],
+        table_properties: t.Dict[str, t.Any],
+        parameter_value: t.Optional[t.Any] = None,
+        parameter_name: t.Optional[str] = None
+    ) -> t.Optional[str]:
+        """
+        Ensure at most one property from a mutually exclusive group is defined.
+
+        Args:
+            property_group_name: Name of the property group (for error messages)
+            property_names: List of mutually exclusive property names
+            table_properties: Table properties dictionary to check
+            parameter_value: Optional parameter value (takes priority over table_properties)
+            parameter_name: Optional parameter name (for error messages)
+
+        Returns:
+            Name of the active property, or None if none found
+            NOTE: If the parameter value is provided, it returns None
+
+        Raises:
+            SQLMeshError: If multiple properties from the group are defined
+
+        Example:
+            >>> PropertyValidator.check_at_most_one(
+            ...     property_group_name="key type",
+            ...     property_names=["primary_key", "duplicate_key", "unique_key", "aggregate_key"],
+            ...     table_properties={"primary_key": "(id)", "duplicate_key": "(id)"}
+            ... )
+            SQLMeshError: Multiple key type properties defined: ['primary_key', 'duplicate_key'].
+                         Only one is allowed.
+        """
+        # Check parameter first (highest priority)
+        if parameter_value is not None:
+            # Check if any conflicting properties exist in table_properties
+            conflicts = [name for name in property_names if name in table_properties]
+            if conflicts:
+                param_display = parameter_name or "parameter"
+                raise SQLMeshError(
+                    f"Conflicting {property_group_name} definitions: "
+                    f"{param_display} provided along with table_properties {conflicts}. "
+                    f"Only one {property_group_name} is allowed."
+                )
+            return None
+
+        # Check table_properties for multiple definitions
+        present = [name for name in property_names if name in table_properties]
+
+        if len(present) > 1:
+            raise SQLMeshError(
+                f"Multiple {property_group_name} properties defined: {present}. "
+                f"Only one is allowed."
+            )
+
+        return present[0] if present else None
+
+
+###############################################################################
+# StarRocks Engine Adapter
 ###############################################################################
 @set_catalog()
 class StarRocksEngineAdapter(
