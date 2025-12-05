@@ -1,0 +1,104 @@
+Model(
+  expressions=[
+    Property(
+      this=name,
+      value=Table(
+        this=Identifier(this=e2e_mixed_model, quoted=False),
+        db=Identifier(this=test, quoted=False))),
+    Property(
+      this=kind,
+      value=ModelKind(this=FULL)),
+    Property(
+      this=dialect,
+      value=Identifier(this=starrocks, quoted=False)),
+    Property(
+      this=grain,
+      value=Tuple(
+        expressions=[
+          Column(
+            this=Identifier(this=order_id, quoted=False)),
+          Column(
+            this=Identifier(this=event_date, quoted=False))])),
+    Property(
+      this=partitioned_by,
+      value=Tuple(
+        expressions=[
+          Identifier(this=event_date, quoted=False)])),
+    Property(
+      this=clustered_by,
+      value=Tuple(
+        expressions=[
+          Column(
+            this=Identifier(this=order_id, quoted=False)),
+          Column(
+            this=Identifier(this=region, quoted=False))])),
+    Property(
+      this=physical_properties,
+      value=Tuple(
+        expressions=[
+          EQ(
+            this=Column(
+              this=Identifier(this=primary_key, quoted=False)),
+            expression=Tuple(
+              expressions=[
+                Column(
+                  this=Identifier(this=order_id, quoted=False)),
+                Column(
+                  this=Identifier(this=event_date, quoted=False))])),
+          EQ(
+            this=Column(
+              this=Identifier(this=distributed_by, quoted=False)),
+            expression=Tuple(
+              expressions=[
+                EQ(
+                  this=Column(
+                    this=Identifier(this=kind, quoted=False)),
+                  expression=Literal(this='HASH', is_string=True)),
+                EQ(
+                  this=Column(
+                    this=Identifier(this=expressions, quoted=False)),
+                  expression=Column(
+                    this=Identifier(this=order_id, quoted=False))),
+                EQ(
+                  this=Column(
+                    this=Identifier(this=buckets, quoted=False)),
+                  expression=Literal(this=8, is_string=False))])),
+          EQ(
+            this=Column(
+              this=Identifier(this=partitions, quoted=False)),
+            expression=Tuple(
+              expressions=[
+                Literal(this='PARTITION p1 VALUES LESS THAN ("2024-01-01", "US")', is_string=True),
+                Literal(this='PARTITION p2 VALUES LESS THAN ("2024-01-01", "EU")', is_string=True)])),
+          EQ(
+            this=Column(
+              this=Identifier(this=replication_num, quoted=False)),
+            expression=Literal(this='1', is_string=True))])),
+    Property(
+      this=columns,
+      value=Schema(
+        expressions=[
+          ColumnDef(
+            this=Identifier(this=order_id, quoted=False),
+            kind=DataType(this=Type.BIGINT, nested=False)),
+          ColumnDef(
+            this=Identifier(this=event_date, quoted=False),
+            kind=DataType(this=Type.DATE, nested=False)),
+          ColumnDef(
+            this=Identifier(this=region, quoted=False),
+            kind=DataType(
+              this=Type.VARCHAR,
+              expressions=[
+                DataTypeParam(
+                  this=Literal(this=50, is_string=False))],
+              nested=False)),
+          ColumnDef(
+            this=Identifier(this=amount, quoted=False),
+            kind=DataType(
+              this=Type.DECIMAL,
+              expressions=[
+                DataTypeParam(
+                  this=Literal(this=18, is_string=False)),
+                DataTypeParam(
+                  this=Literal(this=2, is_string=False))],
+              nested=False))]))])

@@ -1,0 +1,13 @@
+Select(
+  expressions=[
+    Column(
+      this=Identifier(this=order_id, quoted=False)),
+    Column(
+      this=Identifier(this=event_date, quoted=False)),
+    Column(
+      this=Identifier(this=region, quoted=False)),
+    Column(
+      this=Identifier(this=amount, quoted=False))],
+  from=From(
+    this=Table(
+      this=Identifier(this=source_table, quoted=False))))
