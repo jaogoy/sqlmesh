@@ -10,7 +10,8 @@ MODEL (
     /* distributed_by = (kind='HASH', columns=id, bucket=10), */
     /* distributed_by = (kind='HASH', columns=(id, dt), bucket_num=10), */
     /* distributed_by = (kind='RANDOM'), */
-    distributed_by = "(kind='HASH', columns=(id, dt), bucket_num=10)",
+    /* distributed_by = "(kind='HASH', columns=(id, dt), bucket_num=10)", */
+    distributed_by = 10
   ),
 
   columns (

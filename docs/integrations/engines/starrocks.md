@@ -20,50 +20,48 @@ starrocks:
     # Optional MySQL-compatible settings
 ```
 
-## Table Models
+## Table Types
 
-StarRocks supports four table models: DUPLICATE KEY, PRIMARY KEY, UNIQUE KEY, and AGGREGATE KEY. SQLMesh supports **DUPLICATE** and **PRIMARY KEY** models through the `grain` and `physical_properties` configuration.
+StarRocks supports four table types: DUPLICATE KEY, PRIMARY KEY, UNIQUE KEY, and AGGREGATE KEY. SQLMesh supports **DUPLICATE KEY**, **PRIMARY KEY**, and **UNIQUE KEY** types through the `primary_key` configuration.
 
-### DUPLICATE Model (Default)
+> **AGGREGATE KEY** type tables need to set value column aggragate functions.
+
+### DUPLICATE KEY Type (Default)
 
 **Example Configuration:**
+
 ```sql
 MODEL (
   name user_events,
   kind FULL,
   physical_properties (
-    distributed_by (
-      kind = 'HASH',
-      expressions = 'user_id',
-      buckets = 10
-    )
+    distributed_by (kind = HASH, expressions = user_id, buckets = 10)
   )
 );
 ```
 
-### PRIMARY KEY Model
+### PRIMARY KEY Type
 
-For INCREMENTAL models, **PRIMARY KEY tables are required** to support efficient DELETE operations during incremental updates.
+For INCREMENTAL models, **PRIMARY KEY type tables are required** to support efficient DELETE operations during incremental updates.
 
 **Example Configuration:**
+
 ```sql
 MODEL (
   name user_events,
   kind INCREMENTAL_BY_TIME_RANGE(
     time_column event_date
   ),
-  grain (user_id, event_date),  -- Defines PRIMARY KEY columns
   physical_properties (
-    distributed_by (
-      kind = 'HASH',
-      expressions = 'user_id',
-      buckets = 16
-    )
+    primary_key = (user_id, event_date),
+    distributed_by = (kind = HASH, expressions = user_id, buckets = 16)
   )
 );
 ```
 
-The `grain` property automatically maps to `PRIMARY KEY` in StarRocks table creation.
+The `primary_key` property defines the PRIMARY KEY columns in StarRocks table creation.
+
+**Note**: In SQLMesh, `grain` is a logical concept for data uniqueness, while `primary_key` is the physical table property that creates a PRIMARY KEY table type in StarRocks.
 
 ## Limitations
 
@@ -73,28 +71,30 @@ The `grain` property automatically maps to `PRIMARY KEY` in StarRocks table crea
 
 - **DUPLICATE KEY tables do NOT support BETWEEN conditions in DELETE statements**
 - SQLMesh automatically converts `BETWEEN` to `>= AND <=` comparisons, but DUPLICATE KEY tables have additional limitations
-- **Solution**: Use PRIMARY KEY tables for incremental models by specifying the `grain` property
+- **Solution**: Use PRIMARY KEY tables for incremental models by specifying the `primary_key` property
 
 **Incorrect (will fail):**
+
 ```sql
 MODEL (
   name user_events,
   kind INCREMENTAL_BY_TIME_RANGE(time_column event_date),
-  -- Missing grain - creates DUPLICATE KEY table
+  -- Missing primary_key - creates DUPLICATE KEY table
   physical_properties (
-    distributed_by (kind = 'HASH', expressions = 'user_id', buckets = 10)
+    distributed_by = (kind = HASH, expressions = user_id, buckets = 10)
   )
 );
 ```
 
 **Correct:**
+
 ```sql
 MODEL (
   name user_events,
   kind INCREMENTAL_BY_TIME_RANGE(time_column event_date),
-  grain (user_id, event_date),  -- Creates PRIMARY KEY table
   physical_properties (
-    distributed_by (kind = 'HASH', expressions = 'user_id', buckets = 10)
+    primary_key = (user_id, event_date),  -- Creates PRIMARY KEY table
+    distributed_by = (kind = HASH, expressions = user_id, buckets = 10)
   )
 );
 ```
@@ -110,65 +110,63 @@ The StarRocks adapter supports a comprehensive set of table properties that can 
 | `distributed_by` | `Dict` | Distribution configuration            | See Distribution section         |
 | `partitions`     | `Tuple[str]` or `str` | Custom partition expression | `('PARTITION p202401 VALUES LESS THAN ("2024-02-01")')` |
 
-### Distribution Configuration
-
-The `distributed_by` property supports multiple formats:
-
-**Dictionary Format:**
-```sql
-MODEL (
-  name my_table,
-  kind FULL,
-  physical_properties (
-    distributed_by (
-      kind = 'HASH',
-      expressions = 'user_id',
-      buckets = 10
-    )
-  )
-);
-```
-
-```sql
-MODEL (
-  name my_table,
-  kind FULL,
-  physical_properties (
-    distributed_by (
-      kind = 'RANDOM'
-    )
-  )
-);
-```
-
-**Supported Distribution Types:**
-- `HASH`: Hash-based distribution (most common)
-- `RANDOM`: Random distribution
-
-**Bucket Configuration:**
-- Integer value: Fixed number of buckets (e.g., `10`)
-
 ### Partitioning
 
 StarRocks supports range partitioning, list partitioning, and expression partitioning to improve query performance.
 
 **Custom Partition Expression:**
+
 ```sql
 MODEL (
   name my_partitioned_model,
   kind INCREMENTAL_BY_TIME_RANGE(time_column event_date),
-  grain (user_id, event_date),
   partitioned_by (event_date),
   physical_properties (
+    primary_key = (user_id, event_date),
     partitions = (
       'PARTITION p202401 VALUES LESS THAN ("2024-02-01")',
       'PARTITION p202402 VALUES LESS THAN ("2024-03-01")',
       'PARTITION p202403 VALUES LESS THAN ("2024-04-01")'
     ),
-    distributed_by (kind = 'HASH', expressions = 'user_id', buckets = 10)
+    distributed_by (kind = HASH, expressions = user_id, buckets = 10)
   )
 );
 ```
+
+### Distribution Configuration
+
+The `distributed_by` property supports multiple formats:
+
+**Dictionary Format:**
+
+```sql
+MODEL (
+  name my_table,
+  kind FULL,
+  physical_properties (
+    distributed_by = (kind = HASH, expressions = user_id, buckets = 10)
+  )
+);
+```
+
+```sql
+MODEL (
+  name my_table,
+  kind FULL,
+  physical_properties (
+    distributed_by = (kind = RANDOM)
+  )
+);
+```
+
+**Supported Distribution Types:**
+
+- `HASH`: Hash-based distribution (most common)
+- `RANDOM`: Random distribution
+
+**Bucket Configuration:**
+
+- Integer value: Fixed number of buckets (e.g., `10`)
 
 ### Generic Properties
 
@@ -178,13 +176,9 @@ Any additional properties in `physical_properties` are passed through as StarRoc
 MODEL (
   name advanced_table,
   kind FULL,
-  grain (id),
   physical_properties (
-    distributed_by (
-      kind = 'HASH',
-      expressions = 'id',
-      buckets = 8
-    ),
+    primary_key = (id),
+    distributed_by = (kind = HASH, expressions = 'id', buckets = 8),
     replication_num = '1',
     storage_medium = 'SSD',
     enable_persistent_index = 'true',
@@ -204,8 +198,10 @@ SQLMesh supports adding comments to tables and columns with automatic truncation
 MODEL (
   name my_commented_table,
   kind TABLE,
-  grain (id),
   description 'Comprehensive table for tracking user events',
+  physical_properties (
+      primary_key = (id)
+  ),
   column_descriptions (
     id = "Unique identifier for each event",
     user_id = "Foreign key reference to users table",
@@ -215,6 +211,7 @@ MODEL (
 ```
 
 **Limits:**
+
 - Table comments: 2048 characters (automatically truncated)
 - Column comments: 1024 characters (automatically truncated)
 

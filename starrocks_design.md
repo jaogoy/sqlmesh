@@ -167,6 +167,8 @@ EngineAdapter 是 SQLMesh 与数据库之间的适配层，负责：
 
 ### 2.2 执行流程概览
 
+#### 2.2.1 高层次执行流程
+
 ```Plain text
 用户 MODEL 定义
     ↓
@@ -180,6 +182,223 @@ EngineAdapter 处理
     └─ 生成数据库特定的 SQL
     ↓
 执行 SQL 到 StarRocks
+```
+
+#### 2.2.2 详细函数调用链（从 Model 解析到 SQL 执行）
+
+**完整的调用链图**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Phase 1: Model 解析 (详见 SQLMesh模型配置解析流程分析.md)                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  loader.py                                                                  │
+│  └── load_sql_models(path)                                                  │
+│       └── dialect.parse(sql)                 # 分词 + 解析 MODEL 块         │
+│       └── definition.load_sql_based_model()  # 提取 meta_fields             │
+│            └── meta.ModelMeta.__init__()     # Pydantic 验证 + 转换         │
+│                 ├── _partition_and_cluster_validator()                      │
+│                 └── _properties_validator()                                 │
+│                                                                             │
+│  输出: SqlModel 对象                                                        │
+│       • model.physical_properties: Dict[str, exp.Expression]                │
+│       • model.partitioned_by_: List[exp.Expression]                         │
+│       • model.clustered_by: List[exp.Expression]                            │
+│       • model.columns_to_types: Dict[str, exp.DataType]                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Phase 2: Plan 创建与应用                                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  context.py                                                                 │
+│  └── Context.plan(auto_apply=True)                                          │
+│       └── _apply(plan)                                                      │
+│            └── PlanEvaluator.evaluate(plan)                                 │
+│                                                                             │
+│  plan/evaluator.py                                                          │
+│  └── PlanEvaluator.visit_backfill_run_stage(stage)                          │
+│       └── Scheduler.run_merged_intervals(...)                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Phase 3: Scheduler 调度                                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  scheduler.py                                                               │
+│  └── Scheduler.run_merged_intervals()                                       │
+│       ├── _dag()                              # 构建执行 DAG                 │
+│       │    └── CreateNode / EvaluateNode                                    │
+│       └── evaluate(snapshot, ...)             # 调用 SnapshotEvaluator      │
+│                                                                             │
+│  参数传递:                                                                   │
+│  • snapshot: Snapshot 对象（包含 model 引用）                               │
+│  • start, end: 执行时间范围                                                 │
+│  • deployability_index: 可部署性索引                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Phase 4: Snapshot 评估                                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  snapshot/evaluator.py                                                      │
+│  └── SnapshotEvaluator.evaluate()                                           │
+│       └── _evaluate_snapshot()                                              │
+│            ├── _evaluation_strategy(snapshot, adapter)  # 选择策略          │
+│            │    └── 返回: FullRefreshStrategy / IncrementalStrategy / ...   │
+│            │                                                                │
+│            ├── 创建表场景: _execute_create()                                 │
+│            │    └── evaluation_strategy.create(...)                         │
+│            │                                                                │
+│            └── 插入数据场景: apply() → evaluation_strategy.insert(...)      │
+│                                                                             │
+│  _evaluation_strategy() 策略选择:                                           │
+│  • snapshot.is_full → FullRefreshStrategy                                   │
+│  • snapshot.is_incremental → IncrementalByTimeRangeStrategy / ...           │
+│  • snapshot.is_view → ViewStrategy                                          │
+│  • snapshot.is_seed → SeedStrategy                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Phase 5: Evaluation Strategy 执行                                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  snapshot/evaluator.py: MaterializableStrategy.create()                     │
+│                                                                             │
+│  if model.annotated:  # 有明确列定义                                        │
+│      adapter.create_table(                                                  │
+│          table_name,                                                        │
+│          target_columns_to_types=model.columns_to_types_or_raise,           │
+│          table_format=model.table_format,                                   │
+│          storage_format=model.storage_format,                               │
+│          partitioned_by=model.partitioned_by,                               │
+│          clustered_by=model.clustered_by,                                   │
+│          table_properties=physical_properties,  # ← 包含 primary_key 等     │
+│          table_description=model.description,                               │
+│          column_descriptions=model.column_descriptions,                     │
+│      )                                                                      │
+│  else:  # 无列定义，使用 CTAS                                               │
+│      adapter.ctas(table_name, ctas_query, ...)                              │
+│                                                                             │
+│  对于插入操作:                                                               │
+│  • IncrementalStrategy.insert() → adapter.insert_overwrite_by_time_partition│
+│  • FullRefreshStrategy.insert() → adapter.replace_query()                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Phase 6: EngineAdapter 处理 (StarRocks 特定)                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  base.py + starrocks.py                                                     │
+│                                                                             │
+│  create_table() [base.py:619]                                               │
+│  └── _create_table_from_columns() [starrocks.py 重载]                       │
+│       │                                                                     │
+│       ├── 1. 获取 table_properties                                          │
+│       │    table_properties = kwargs.get("table_properties", {})            │
+│       │                                                                     │
+│       ├── 2. 提取并验证 key 列                                              │
+│       │    key_type, key_columns = _extract_and_validate_key_columns(       │
+│       │        table_properties, primary_key                                │
+│       │    )                                                                │
+│       │    # key_type: "primary_key" / "duplicate_key" / None               │
+│       │    # key_columns: ("id", "dt", ...)                                 │
+│       │                                                                     │
+│       ├── 3. 重排序列（key 列移到前面）                                      │
+│       │    target_columns_to_types = _reorder_columns_for_key(              │
+│       │        target_columns_to_types, key_columns, key_type               │
+│       │    )                                                                │
+│       │                                                                     │
+│       └── 4. 调用基类方法                                                    │
+│            super()._create_table_from_columns(                              │
+│                table_name, target_columns_to_types,                         │
+│                primary_key=key_columns if key_type=="primary_key" else None,│
+│                **kwargs                                                     │
+│            )                                                                │
+│                                                                             │
+│  _create_table_from_columns() [base.py:737]                                 │
+│  └── _build_schema_exp()                      # 构建列定义 + PRIMARY KEY    │
+│  └── _create_table(schema, None, **kwargs)    # 创建表                      │
+│                                                                             │
+│  _create_table() [base.py:961]                                              │
+│  └── _build_create_table_exp(**kwargs)        # 构建 CREATE TABLE 表达式    │
+│  └── execute(create_exp)                      # 执行 SQL                    │
+│                                                                             │
+│  _build_create_table_exp() [base.py:999]                                    │
+│  └── _build_table_properties_exp(**kwargs)    # 构建表属性                   │
+│       │   [starrocks.py 重载]                                               │
+│       │                                                                     │
+│       ├── 处理 distributed_by → DistributedByProperty                       │
+│       ├── 处理 duplicate_key → DuplicateKeyColumnConstraint                 │
+│       ├── 处理 partitioned_by → PartitionedByProperty                       │
+│       ├── 处理 PROPERTIES → 转为键值对                                      │
+│       └── 返回 exp.Properties(expressions=[...])                            │
+│                                                                             │
+│  └── exp.Create(                                                            │
+│       this=schema,                                                          │
+│       kind="TABLE",                                                         │
+│       properties=properties  # ← 包含所有 StarRocks 属性                    │
+│  )                                                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Phase 7: SQL 生成与执行                                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  base.py: execute()                                                         │
+│  └── self._execute(expressions)                                             │
+│       │                                                                     │
+│       ├── 如果是 exp.Expression:                                            │
+│       │    sql = expression.sql(dialect=self.dialect, ...)                  │
+│       │    # 调用 SQLGlot Generator 生成 SQL                                │
+│       │                                                                     │
+│       └── 发送 SQL 到数据库执行                                              │
+│            self.cursor.execute(sql)                                         │
+│                                                                             │
+│  SQLGlot Generator (starrocks.py):                                          │
+│  • primarykeycolumnconstraint_sql()  → "PRIMARY KEY(id, dt)"                │
+│  • distributedbyproperty_sql()       → "DISTRIBUTED BY HASH(id) BUCKETS 10"│
+│  • partitionedbyproperty_sql()       → "PARTITION BY (dt)"                  │
+│  • property_sql()                    → "'key' = 'value'"                    │
+│                                                                             │
+│  最终 SQL 示例:                                                              │
+│  CREATE TABLE IF NOT EXISTS `db`.`table` (                                  │
+│      `id` INT,                                                              │
+│      `dt` DATE,                                                             │
+│      `name` VARCHAR(100)                                                    │
+│  )                                                                          │
+│  PRIMARY KEY(`id`, `dt`)                                                    │
+│  PARTITION BY (dt)                                                          │
+│  DISTRIBUTED BY HASH(`id`) BUCKETS 10                                       │
+│  PROPERTIES ("replication_num" = "1")                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 2.2.3 关键参数传递路径
+
+以 `primary_key` 为例，展示参数如何从 MODEL 定义传递到最终 SQL：
+
+```
+MODEL 定义:
+physical_properties (
+    primary_key = (order_id, event_date)
+)
+        ↓
+[dialect.py] 解析为:
+exp.Tuple(expressions=[exp.Column("order_id"), exp.Column("event_date")])
+        ↓
+[meta.py] 存储到:
+model.physical_properties = {"primary_key": exp.Tuple(...)}
+        ↓
+[evaluator.py] MaterializableStrategy.create() 传递:
+table_properties=model.physical_properties  # 包含 primary_key
+        ↓
+[starrocks.py] _extract_and_validate_key_columns() 提取:
+key_type = "primary_key"
+key_columns = ("order_id", "event_date")
+        ↓
+[starrocks.py] _reorder_columns_for_key() 重排序列:
+{"order_id": INT, "event_date": DATE, ...}  # key 列在前
+        ↓
+[base.py] _create_table_from_columns() 构建:
+exp.PrimaryKey(expressions=[exp.Column("order_id"), exp.Column("event_date")])
+        ↓
+[starrocks Generator] 生成 SQL:
+PRIMARY KEY(`order_id`, `event_date`)
 ```
 
 ### 2.3 两级 AST 转换

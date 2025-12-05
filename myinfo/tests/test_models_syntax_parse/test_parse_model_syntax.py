@@ -266,6 +266,7 @@ MODEL_MAP = {
     'list': 'test_list_partition',
     'expr': 'test_expression_partition',
     'all_partition': 'test_all_partitions',
+    'all_part': 'test_all_partitions',
     'part': 'test_all_partitions',
 
     # Multi-column partition tests
@@ -275,6 +276,7 @@ MODEL_MAP = {
 
     # Distribution tests
     'all_distribution': 'test_distribution_hash',
+    'all_dist': 'test_distribution_hash',
     'dist': 'test_distribution_hash',
     'hash': 'test_distribution_hash',
     'random': 'test_distribution_random',
@@ -289,6 +291,10 @@ MODEL_MAP = {
     # Comprehensive test
     'comp': 'test_comprehensive_properties',
     'comprehensive': 'test_comprehensive_properties',
+
+    # All properties test
+    'all': 'test_all_properties',
+    'all_props': 'test_all_properties',
 }
 
 

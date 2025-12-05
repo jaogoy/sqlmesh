@@ -230,6 +230,7 @@ parameter: `distributed_by`
 - A **tuple** of folowing **EQ** items (recommended)
   - `kind = HASH` or `kind = "HASH"`.
   - `expressions = (col1, col2, col3)`, alias: `columns`). (optional)
+    - `"col1, col2, col3"` is also acceptable.
   - `buckets = 10`, alias `bucket`, `bucket_num`. (optional)
 - Or a **string**, such as:
   - `"HASH(id) BUCKETS 10"`
