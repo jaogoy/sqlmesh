@@ -302,7 +302,7 @@ class ColumnType(DeclarativeType):
         if self.normalized_type == "literal":
             return exp.Literal.string(validated.this)
         if self.normalized_type == "str":
-            return validated.this
+            return str(validated.this)
         # None or "column" - keep as-is
         return validated
 
@@ -907,7 +907,7 @@ class DistributionTupleInputType(StructuredTupleType):
             doc="Distribution type: HASH or RANDOM"
         ),
         "columns": Field(
-            type=SequenceOf(ColumnType(), IdentifierType(normalized_type="column")),
+            type=SequenceOf(ColumnType(), IdentifierType(normalized_type="column"), allow_single=True),
             required=False,
             aliases=["expressions"],
             doc="Columns for HASH distribution"
@@ -921,20 +921,68 @@ class DistributionTupleInputType(StructuredTupleType):
     }
 
 class DistributionTupleOutputType(StructuredTupleType):
+    """
+    Output validator for distribution tuple.
+
+    Used to validate normalized distribution values which are already dicts.
+    Overrides validate() to handle dict input directly (for output validation),
+    while parent class handles tuple/string input (for input validation).
+    """
     FIELDS = {
         "kind": Field(
-            type=EnumType(["HASH", "RANDOM"], normalized_type="str"),
+            type=EnumType(["HASH", "RANDOM"]),
             required=True,
         ),
         "columns": Field(
-            type=SequenceOf(ColumnType()),
+            type=SequenceOf(ColumnType(), allow_single=False),
             required=False,
         ),
         "buckets": Field(
-            type=AnyOf(LiteralType()),
+            type=LiteralType(),
             required=False,
         )
     }
+
+    def validate(self, value: t.Any) -> t.Optional[t.Dict[str, t.Any]]:
+        """
+        Validate a distribution value for OUTPUT validation.
+
+        For output validation, accepts:
+        - dict: Validate structure directly (normalized output)
+        - tuple/string: Delegate to parent class (for completeness)
+
+        Returns: The dict if valid, None otherwise
+        """
+        # For output validation, handle dict directly
+        if isinstance(value, dict):
+            # Validate required 'kind' field
+            kind = value.get("kind")
+            if kind is None:
+                return None
+
+            # Validate 'kind' is a valid enum value
+            kind_spec = self.FIELDS["kind"].type
+            if kind_spec.validate(kind) is None:
+                return None
+
+            # Validate 'columns' if present
+            columns = value.get("columns")
+            if columns is not None:
+                columns_spec = self.FIELDS["columns"].type
+                if columns_spec.validate(columns) is None:
+                    return None
+
+            # Validate 'buckets' if present
+            buckets = value.get("buckets")
+            if buckets is not None:
+                buckets_spec = self.FIELDS["buckets"].type
+                if buckets_spec.validate(buckets) is None:
+                    return None
+
+            return value
+
+        # For tuple/string, delegate to parent class
+        return super().validate(value)
 
     # ============================================================
     # Factory methods for conversion from other normalized types
@@ -983,7 +1031,8 @@ class DistributionTupleOutputType(StructuredTupleType):
 
         if func_name == "HASH":
             # Extract columns from HASH(col1, col2, ...)
-            columns: list[exp.Column] = list(func.args) if hasattr(func, 'args') else []
+            columns: list[exp.Column] = [func.this] if isinstance(func.this, exp.Column) else []
+            columns.extend(func.expressions)
             return {
                 "kind": "HASH",
                 "columns": columns,
@@ -1034,10 +1083,10 @@ class DistributionTupleOutputType(StructuredTupleType):
             return normalized_value
         elif isinstance(normalized_value, str):  # noqa: RET505
             # From EnumType: "RANDOM"
-            return DistributionTupleInputType.from_enum(normalized_value, buckets)
+            return DistributionTupleOutputType.from_enum(normalized_value, buckets)
         elif isinstance(normalized_value, (exp.Func, exp.Anonymous)):
             # From FuncType: HASH(id, dt)
-            return DistributionTupleInputType.from_func(normalized_value, buckets)
+            return DistributionTupleOutputType.from_func(normalized_value, buckets)
         else:
             raise TypeError(
                 f"Cannot convert {type(normalized_value).__name__} to distribution dict. "
@@ -1180,7 +1229,7 @@ class PropertySpecs():
         "distributed_by": DistributedByInputSpec,
 
         # Ordering property
-        "order_by": OrderByInputSpec,
+        "clustered_by": OrderByInputSpec,
 
         # Note: All other properties not listed here will be handled, an example here
         "replication_num": GenericPropertyInputSpec,
@@ -1220,7 +1269,7 @@ class PropertySpecs():
             EnumType(["RANDOM"]),  # "RANDOM"
             FuncType(),  # "HASH(id)",
         ),  # Still dict | str | exp.Func after normalize
-        "order_by": GeneralColumnListOutputSpec,
+        "clustered_by": GeneralColumnListOutputSpec,
         # Generic properties use GenericPropertyOutputSpec, an example here
         "replication_num": GenericPropertyOutputSpec,
     }
@@ -1317,7 +1366,10 @@ class PropertyValidator:
             >>> PropertyValidator.ensure_parenthesized('(id1, id2)')
             '(id1, id2)'
         """
-        if not isinstance(value, str):
+        # logger.debug("ensure_parenthesized. value: %s, type: %s", value, type(value))
+        if isinstance(value, exp.Literal) and value.is_string:
+            value = value.this
+        elif not isinstance(value, str):
             return value
 
         stripped = value.strip()
@@ -1479,6 +1531,7 @@ class PropertyValidator:
         """
         if not exclusive_property_names:
             exclusive_property_names = PropertyValidator.EXCLUSIVE_PROPERTY_NAME_MAP.get(property_name, set()) | {property_name}
+        # logger.debug("Checking at most one property for '%s': %s", property_name, exclusive_property_names)
         # Check parameter first (highest priority)
         if parameter_value is not None:
             # Check if any conflicting properties exist in table_properties
@@ -1494,7 +1547,7 @@ class PropertyValidator:
 
         # Check table_properties for multiple definitions
         present = [name for name in exclusive_property_names if name in table_properties]
-        logger.debug(f"get table key name from table_properties: {present}")
+        # logger.debug("Get table key names for %s from table_properties: %s", property_name, present)
 
         if len(present) > 1:
             raise SQLMeshError(
@@ -1933,12 +1986,8 @@ class StarRocksEngineAdapter(
         if primary_key:
             table_properties["primary_key"] = primary_key
             logger.debug("_create_table_from_columns: unified primary_key into table_properties")
-        # Update primary_key based on extracted key type
-        if key_type == "primary_key":
-            primary_key = key_columns
-            logger.debug("_create_table_from_columns: delegating PRIMARY KEY to base class")
-        else:
-            logger.debug("_create_table_from_columns: key_type=%s may be handled in _build_table_key_property", key_type)
+        elif key_type:
+            logger.debug("table key type '%s' may be handled in _build_table_key_property", key_type)
 
         # StarRocks key column ordering constraint: All key types need reordering
         if key_columns:
@@ -1947,13 +1996,15 @@ class StarRocksEngineAdapter(
             )
             logger.debug("_create_table_from_columns: reordered columns for %s", key_type)
 
-        # For PRIMARY KEY: base class generates exp.PrimaryKey() when SUPPORTS_INDEXES=True
-        # For other keys: base class does nothing, we handle in _build_table_key_property
-        primary_key = [c.name if isinstance(c, exp.Column) else str(c) for c in primary_key] if primary_key else None
+        # IMPORTANT: Do NOT pass primary_key to base class!
+        # Unlike other databases, StarRocks requires PRIMARY KEY to be in POST_SCHEMA location
+        # (in properties section after columns), not inside schema (inside column definitions).
+        # We handle ALL key types (including PRIMARY KEY) in _build_table_key_property.
+        logger.debug("_create_table_from_columns: NOT passing primary_key to base class (handled in _build_table_key_property)")
         super()._create_table_from_columns(
             table_name=table_name,
             target_columns_to_types=target_columns_to_types,
-            primary_key=primary_key,
+            primary_key=None,  # StarRocks handles PRIMARY KEY in properties, not schema
             exists=exists,
             table_description=table_description,
             column_descriptions=column_descriptions,
@@ -1987,16 +2038,14 @@ class StarRocksEngineAdapter(
            - Handled in _build_partition_property
 
         2. special for primary_key:
-           - Already normalized in _create_table_from_columns
-           - Handled by base class via SUPPORTS_INDEXES (generates exp.PrimaryKey)
-           - Skipped in _build_table_key_property
+           - Still need to be processed in _build_table_key_property
 
         3. Other key types (duplicate_key, unique_key, aggregate_key):
            - Only available via physical_properties
            - Handled in _build_table_key_property
 
         Handles:
-        - Key constraints (DUPLICATE KEY, UNIQUE KEY) - PRIMARY KEY handled by base class
+        - Key constraints (PRIMARY KEY, DUPLICATE KEY, UNIQUE KEY)
         - Partition expressions (RANGE/LIST/EXPRESSION)
         - Distribution (HASH/RANDOM)
         - Order by (clustering)
@@ -2007,8 +2056,7 @@ class StarRocksEngineAdapter(
             partitioned_by: Partition columns/expression from model parameter (takes priority)
             clustered_by: Clustering columns from model parameter (takes priority)
             table_properties: Dictionary containing physical_properties:
-                - primary_key: Already normalized in _create_table_from_columns
-                - duplicate_key/unique_key/aggregate_key: Tuple/list of column names
+                - primary_key/duplicate_key/unique_key/aggregate_key: Tuple/list of column names
                 - partitioned_by(partition_by): Partition definition (fallback)
                 - distributed_by: Tuple of EQ expressions (kind, expressions, buckets) or string
                 - clustered_by(order_by): Clustering definition (fallback)
@@ -2017,8 +2065,7 @@ class StarRocksEngineAdapter(
         """
         properties: t.List[exp.Expression] = []
         table_properties_copy = dict(table_properties) if table_properties else {}
-        logger.debug("_build_table_properties_exp: table_properties=%s, table_properties_copy=%s",
-                    table_properties.keys() if table_properties else [], table_properties_copy.keys())
+        logger.debug("_build_table_properties_exp: table_properties=%s", table_properties.keys() if table_properties else [])
 
         # Validate all property names at once
         PropertyValidator.check_all_invalid_names(table_properties_copy)
@@ -2030,9 +2077,9 @@ class StarRocksEngineAdapter(
             property_description="key type",
             table_properties=table_properties_copy,
         )
-        logger.debug("_build_table_properties_exp: active_key_type=%s", active_key_type)
+        logger.debug("_build_table_properties_exp: active_key_type='%s'", active_key_type)
 
-        # 1. Extract key columns for partition/distribution validation (read-only, don't pop yet)
+        # 0. Extract key columns for partition/distribution validation (read-only, don't pop yet)
         key_type, key_columns = None, None
         if active_key_type:
             key_type = active_key_type
@@ -2044,14 +2091,21 @@ class StarRocksEngineAdapter(
             key_columns = tuple(col.name for col in normalized)
             logger.debug("_build_table_properties_exp: key_type=%s, key_columns=%s", key_type, key_columns)
 
-        # 2. Handle key constraints (non-PRIMARY KEY types only)
-        # PRIMARY KEY is handled by base class via SUPPORTS_INDEXES
+        # 1. Handle key constraints (ALL types including PRIMARY KEY)
         key_prop = self._build_table_key_property(table_properties_copy, active_key_type)
         if key_prop:
             properties.append(key_prop)
             logger.debug("_build_table_properties_exp: generated key_prop=%s", type(key_prop).__name__)
         else:
-            logger.debug("_build_table_properties_exp: key_prop skipped (primary_key handled by base class or not defined)")
+            logger.debug("_build_table_properties_exp: key_prop skipped (not defined)")
+
+        # 2. Add table comment
+        if table_description:
+            properties.append(
+                exp.SchemaCommentProperty(
+                    this=exp.Literal.string(self._truncate_table_comment(table_description))
+                )
+            )
 
         # 3. Handle partitioned_by (PARTITION BY RANGE/LIST/EXPRESSION)
         partition_prop = self._build_partition_property(
@@ -2073,22 +2127,14 @@ class StarRocksEngineAdapter(
             logger.debug("_build_table_properties_exp: distributed_prop skipped (not defined)")
 
         # 5. Handle order_by/clustered_by (ORDER BY ...)
-        order_prop = self._build_order_by_property(table_properties_copy, clustered_by)
+        order_prop = self._build_order_by_property(table_properties_copy, clustered_by or None)
         if order_prop:
             properties.append(order_prop)
             logger.debug("_build_table_properties_exp: generated order_prop=%s", type(order_prop).__name__)
         else:
             logger.debug("_build_table_properties_exp: order_prop skipped (not defined)")
 
-        # 6. Add table comment
-        if table_description:
-            properties.append(
-                exp.SchemaCommentProperty(
-                    this=exp.Literal.string(self._truncate_table_comment(table_description))
-                )
-            )
-
-        # 7. Handle other properties (replication_num, storage_medium, etc.)
+        # 5. Handle other properties (replication_num, storage_medium, etc.)
         other_props = self._build_other_properties(table_properties_copy)
         properties.extend(other_props)
 
@@ -2100,10 +2146,14 @@ class StarRocksEngineAdapter(
         active_key_type: t.Optional[str]
     ) -> t.Optional[exp.Expression]:
         """
-        Build key constraint property for non-PRIMARY KEY types.
+        Build key constraint property for ALL key types including PRIMARY KEY.
 
-        PRIMARY KEY is handled by base class via SUPPORTS_INDEXES=True,
-        so we only process:
+        Unlike other databases where PRIMARY KEY is handled by base class in schema,
+        StarRocks requires ALL key types (PRIMARY KEY, DUPLICATE KEY, UNIQUE KEY, AGGREGATE KEY)
+        to be in POST_SCHEMA location (properties section after columns).
+
+        Handles:
+        - PRIMARY KEY
         - DUPLICATE KEY
         - UNIQUE KEY
         - AGGREGATE KEY (when implemented)
@@ -2113,23 +2163,13 @@ class StarRocksEngineAdapter(
             active_key_type: The active key type or None
 
         Returns:
-            Key property expression for non-PRIMARY KEY types, or None
+            Key property expression for the active key type, or None
         """
         if not active_key_type:
             logger.debug("_build_table_key_property: no active_key_type, skipped")
             return None
 
-        # Skip PRIMARY KEY - it's handled by base class
-        if active_key_type == "primary_key":
-            # Pop it to avoid it appearing in other_properties
-            table_properties.pop("primary_key", None)
-            logger.debug("_build_table_key_property: primary_key delegated to base class, skipped")
-            return None
-
-        logger.debug(
-            "_build_table_key_property: processing %s from table_properties",
-            active_key_type
-        )
+        logger.debug("_build_table_key_property: processing %s", active_key_type)
 
         # Configuration: key_name -> Property class (excluding primary_key)
         KEY_PROPERTY_CLASSES: t.Dict[str, t.Type[exp.Expression]] = {
@@ -2142,14 +2182,22 @@ class StarRocksEngineAdapter(
         property_class = KEY_PROPERTY_CLASSES.get(active_key_type)
         key_value = table_properties.pop(active_key_type, None)
         if not property_class:
-            # Unknown key type (e.g., aggregate_key not implemented yet)
+            # Aggregate key requires special handling
+            if active_key_type == "aggregate_key":
+                raise SQLMeshError(
+                    "AGGREGATE KEY tables are not currently supported. "
+                    "AGGREGATE KEY requires specifying aggregation functions (SUM/MAX/MIN/REPLACE) "
+                    "for value columns, which is not supported in the current model configuration syntax. "
+                    "Please use PRIMARY KEY, UNIQUE KEY, or DUPLICATE KEY instead."
+                )
+            # Unknown key type
             logger.warning(f"[StarRocks] Unknown key type: {active_key_type}")
             return None
         if key_value is None:
             logger.error(f"Failed to get the parameter value for {active_key_type!r}")
             return None
 
-        logger.debug("_build_table_key_property: input value=%s", key_value)
+        logger.debug("_build_table_key_property: input key=%s value=%s", active_key_type, key_value)
 
         # Validate and normalize
         # preprocess_parentheses=True handles string preprocessing like 'id, dt' -> '(id, dt)'
@@ -2202,20 +2250,20 @@ class StarRocksEngineAdapter(
             property_name="partitioned_by",
             property_description="partition definition",
             table_properties=table_properties,
-            parameter_value=partitioned_by,
+            parameter_value=partitioned_by or None,
         )
 
         # If parameter was provided, it takes priority
         if partitioned_by:
             logger.debug("_build_partition_property: using partitioned_by from model param=%s", partitioned_by)
-        elif partitioned_by is None and partition_param_name:
+        elif not partitioned_by and partition_param_name:
             # Get from table_properties
             partitioned_by = table_properties.pop(partition_param_name, None)
             logger.debug("_build_partition_property: using partitioned_by from table_properties[%s]=%s",
                         partition_param_name, partitioned_by)
 
         if not partitioned_by:
-            logger.debug("_build_partition_property: no partitioned_by defined, skipped")
+            logger.debug("_build_partition_property: no 'partitioned_by' defined, skipped")
             return None
 
         # Parse partition expressions to extract columns and kind (RANGE/LIST)
@@ -2242,9 +2290,18 @@ class StarRocksEngineAdapter(
                 )
 
         # Get partition definitions (RANGE/LIST partitions)
-        if partitions:= table_properties.pop("partitions", None):
-            partitions = PropertyValidator.validate_and_normalize_property("partitions", partitions)
-        logger.debug("Pre-created partitions: %s, type: %s", partitions, type(partitions))
+        # Note: Expression-based partitioning (partition_kind=None) does not support pre-created partitions
+        if partitions := table_properties.pop("partitions", None):
+            logger.debug("Pre-created partitions: %s", partitions)
+            if partition_kind is None:
+                logger.warning(
+                    "[StarRocks] 'partitions' parameter is ignored for expression-based partitioning. "
+                    "Expression partitioning creates partitions automatically and does not support "
+                    "pre-created partition definitions."
+                )
+                partitions = None  # Ignore partitions for expression-based partitioning
+            else:
+                partitions = PropertyValidator.validate_and_normalize_property("partitions", partitions)
 
         # Build partition expression using base class method
         result = self._build_partitioned_by_exp(
@@ -2352,6 +2409,8 @@ class StarRocksEngineAdapter(
         """
         partition_kind = kwargs.get("partition_kind")
         partitions: t.Optional[t.List[str]] = kwargs.get("partitions")
+        logger.debug("_build_partitioned_by_exp: partition_kind=%s, partitioned_by=%s, partitions=%s",
+                     partition_kind, partitioned_by, partitions)
 
         # Process partitions to create_expressions
         # partitions is already List[str] after SPEC normalization
@@ -2371,7 +2430,7 @@ class StarRocksEngineAdapter(
                 create_expressions=create_expressions,
             )
         elif partition_kind is None:
-            return exp.PartitionedByProperty(partition_expressions=partitioned_by)
+            return exp.PartitionedByProperty(this=exp.tuple_(*partitioned_by))
 
     def _build_distributed_by_property(
         self,
@@ -2403,13 +2462,14 @@ class StarRocksEngineAdapter(
 
         # No default - if not set, return None
         if distributed_by is None:
-            logger.debug("_build_distributed_by_property: no distributed_by defined, skipped")
+            logger.debug("_build_distributed_by_property: no 'distributed_by' defined, skipped")
             return None
 
         logger.debug("_build_distributed_by_property: using distributed_by from table_properties=%s", distributed_by)
 
         # Try to parse complex string with BUCKETS first
         unified = self._parse_distribution_with_buckets(distributed_by)
+        logger.debug("_build_distributed_by_property: parsed distribution with buckets: %s", unified)
         if unified is None:
             # Fall back to SPEC-based parsing
             normalized = PropertyValidator.validate_and_normalize_property("distributed_by", distributed_by)
@@ -2445,7 +2505,7 @@ class StarRocksEngineAdapter(
             buckets=buckets_expr,
             order=None,
         )
-        logger.debug("_build_distributed_by_property: generated DistributedByProperty")
+        logger.debug("_build_distributed_by_property: generated DistributedByProperty: %s", result)
         return result
 
     def _parse_distribution_with_buckets(
@@ -2494,6 +2554,7 @@ class StarRocksEngineAdapter(
 
         # Parse the HASH/RANDOM part via SPEC
         normalized = PropertyValidator.validate_and_normalize_property("distributed_by", hash_part)
+        logger.debug("_parse_distribution_with_buckets: parsed hash part: %s, type: %s", normalized, type(normalized))
 
         return DistributionTupleOutputType.to_unified_dict(normalized, int(buckets_str))
 
@@ -2544,7 +2605,7 @@ class StarRocksEngineAdapter(
             logger.debug("_build_order_by_property: generated Cluster")
             return result
         else:  # noqa: RET505
-            logger.debug("_build_order_by_property: no clustered_by defined, skipped")
+            logger.debug("_build_order_by_property: no 'clustered_by' defined, skipped")
             return None
 
     def _build_other_properties(
@@ -2624,7 +2685,7 @@ class StarRocksEngineAdapter(
             table_properties=table_properties,
             parameter_value=primary_key,
         )
-        logger.debug(f"get table key: {active_key_type}")
+        logger.debug("get table key: %s", {active_key_type})
 
         # If parameter primary_key was provided, return it
         if primary_key:
@@ -2642,7 +2703,7 @@ class StarRocksEngineAdapter(
         )
         key_columns = tuple(col.name for col in normalized)
 
-        logger.debug(f"Extracted {active_key_type} from table_properties: {key_columns}")
+        logger.debug("Extracted '%s' from table_properties, value=%s", active_key_type, key_columns)
 
         return (active_key_type, key_columns)
 

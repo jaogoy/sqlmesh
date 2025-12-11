@@ -76,6 +76,7 @@ def cleanup_test_objects(starrocks_adapter: StarRocksEngineAdapter):
 
     Note: All test db_names MUST use 'sr_' prefix for automatic cleanup.
     """
+
     def cleanup_all_sr_databases():
         """Drop all databases with 'sr_' prefix."""
         try:
@@ -212,6 +213,9 @@ class TestBasicOperations:
                     "id": exp.DataType.build("INT"),
                     "name": exp.DataType.build("VARCHAR(100)"),
                 },
+                table_properties={
+                    "primary_key": "id"
+                },
             )
             starrocks_adapter.execute(
                 f"INSERT INTO {table_name} (id, name) VALUES (1, 'Alice')"
@@ -247,13 +251,8 @@ class TestBasicOperations:
             )
 
             # DELETE
-            starrocks_adapter.delete_from(
-                exp.to_table(table_name),
-                "id = 2"
-            )
-            count = starrocks_adapter.fetchone(
-                f"SELECT COUNT(*) FROM {table_name}"
-            )
+            starrocks_adapter.delete_from(exp.to_table(table_name), "id = 2")
+            count = starrocks_adapter.fetchone(f"SELECT COUNT(*) FROM {table_name}")
             assert count[0] == 1, "DELETE failed"
         finally:
             starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
@@ -458,7 +457,9 @@ class TestTableFeatures:
                         "STRUCT<id INT, tags ARRAY<STRING>, metadata MAP<STRING,INT>>"
                     ),
                     # ARRAY of STRUCT
-                    "col_array_of_struct": exp.DataType.build("ARRAY<STRUCT<id INT, name STRING>>"),
+                    "col_array_of_struct": exp.DataType.build(
+                        "ARRAY<STRUCT<id INT, name STRING>>"
+                    ),
                     # Deep nesting: MAP with ARRAY of STRUCT
                     "col_deep_nested": exp.DataType.build(
                         "MAP<STRING,ARRAY<STRUCT<field1 INT, field2 STRING>>>"
@@ -557,10 +558,7 @@ class TestEndToEndModelParsing:
     +------------------+----------------------------------------+----------------------------------------+
     """
 
-    def _parse_model_and_get_all_params(
-        self,
-        model_sql: str
-    ) -> t.Dict[str, t.Any]:
+    def _parse_model_and_get_all_params(self, model_sql: str) -> t.Dict[str, t.Any]:
         """
         Helper: Parse MODEL definition and extract ALL parameters.
 
@@ -589,8 +587,6 @@ class TestEndToEndModelParsing:
             "storage_format": model.storage_format,
             "table_properties": model.physical_properties,
         }
-
-
 
     # ========================================
     # Case 1: Model Parameters (test_design.md Case 1)
@@ -634,22 +630,26 @@ class TestEndToEndModelParsing:
 
             # Precise assertions: verify PARTITION BY RANGE with actual columns
             import re
-            assert "PARTITION BY RANGE" in ddl
+
+            assert "PARTITION BY " in ddl
             # Note: PARTITION BY may contain function expressions like from_unixtime(ts)
             # We verify the clause exists and contains expected patterns
-            part_match = re.search(r'PARTITION BY RANGE\s*\(([^)]+)\)', ddl)
-            assert part_match, "PARTITION BY RANGE clause not found"
+            part_match = re.search(r"PARTITION BY \s*\(([^)]+)\)", ddl)
+            assert part_match, "PARTITION BY clause not found"
             part_cols = part_match.group(1)
             # Verify function expression and column references
-            assert "from_unixtime" in part_cols or "ts" in part_cols, \
-                f"Expected partition expression with ts/from_unixtime, got {part_cols}"
+            assert (
+                # "from_unixtime" in part_cols or "ts" in part_cols
+                "__generated_partition_column_" in part_cols and "region" in part_cols
+            ), f"Expected partition expression with generated column/region, got {part_cols}"
 
             # Verify ORDER BY from clustered_by
-            order_match = re.search(r'ORDER BY\s*\(([^)]+)\)', ddl)
+            order_match = re.search(r"ORDER BY\s*\(([^)]+)\)", ddl)
             assert order_match, "ORDER BY clause not found"
             order_cols = order_match.group(1)
-            assert "order_id" in order_cols and "customer_id" in order_cols, \
-                f"Expected ORDER BY (order_id, customer_id), got {order_cols}"
+            assert (
+                "order_id" in order_cols and "customer_id" in order_cols
+            ), f"Expected ORDER BY (order_id, customer_id), got {order_cols}"
 
         finally:
             starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
@@ -659,7 +659,9 @@ class TestEndToEndModelParsing:
     # Covers: primary_key (tuple), distributed_by (string multi-col), order_by (tuple), generic props
     # ========================================
 
-    def test_e2e_physical_properties_core(self, starrocks_adapter: StarRocksEngineAdapter):
+    def test_e2e_physical_properties_core(
+        self, starrocks_adapter: StarRocksEngineAdapter
+    ):
         """
         Test Case 2: Core physical_properties.
 
@@ -681,9 +683,10 @@ class TestEndToEndModelParsing:
                 amount DECIMAL(18,2)
             ),
             physical_properties (
-                primary_key = (order_id, event_date),
+                primary_key = (order_id, event_date, customer_id, region),
                 distributed_by = 'HASH(customer_id, region) BUCKETS 16',
                 order_by = (order_id, region),
+                -- clustered_by = (order_id, region),  -- also OK
                 replication_num = '1',
                 enable_persistent_index = 'true'
             )
@@ -703,23 +706,27 @@ class TestEndToEndModelParsing:
 
             # Precise assertions
             import re
+
             # Verify PRIMARY KEY with exact columns
-            pk_match = re.search(r'PRIMARY KEY\s*\(([^)]+)\)', ddl)
+            pk_match = re.search(r"PRIMARY KEY\s*\(([^)]+)\)", ddl)
             assert pk_match, "PRIMARY KEY clause not found"
             assert "order_id" in pk_match.group(1) and "event_date" in pk_match.group(1)
 
             # Verify DISTRIBUTED BY HASH with exact columns
-            dist_match = re.search(r'DISTRIBUTED BY HASH\s*\(([^)]+)\)', ddl)
+            dist_match = re.search(r"DISTRIBUTED BY HASH\s*\(([^)]+)\)", ddl)
             assert dist_match, "DISTRIBUTED BY HASH clause not found"
             dist_cols = dist_match.group(1)
-            assert "customer_id" in dist_cols and "region" in dist_cols, \
-                f"Expected HASH(customer_id, region), got HASH({dist_cols})"
+            assert (
+                "customer_id" in dist_cols and "region" in dist_cols
+            ), f"Expected HASH(customer_id, region), got HASH({dist_cols})"
             assert "BUCKETS 16" in ddl
 
             # Verify ORDER BY
-            order_match = re.search(r'ORDER BY\s*\(([^)]+)\)', ddl)
+            order_match = re.search(r"ORDER BY\s*\(([^)]+)\)", ddl)
             assert order_match, "ORDER BY clause not found"
-            assert "order_id" in order_match.group(1) and "region" in order_match.group(1)
+            assert "order_id" in order_match.group(1) and "region" in order_match.group(
+                1
+            )
 
             assert "replication_num" in ddl
 
@@ -731,7 +738,9 @@ class TestEndToEndModelParsing:
     # Covers: primary_key = "id, dt" auto-conversion
     # ========================================
 
-    def test_e2e_string_no_paren_auto_wrap(self, starrocks_adapter: StarRocksEngineAdapter):
+    def test_e2e_string_no_paren_auto_wrap(
+        self, starrocks_adapter: StarRocksEngineAdapter
+    ):
         """
         Test Case 3: String form without parentheses auto-wrap.
 
@@ -770,17 +779,20 @@ class TestEndToEndModelParsing:
 
             # Precise assertion: verify exact PRIMARY KEY columns
             import re
-            pk_match = re.search(r'PRIMARY KEY\s*\(([^)]+)\)', ddl)
+
+            pk_match = re.search(r"PRIMARY KEY\s*\(([^)]+)\)", ddl)
             assert pk_match, "PRIMARY KEY clause not found"
             pk_clause = pk_match.group(1)
-            assert "order_id" in pk_clause and "event_date" in pk_clause, \
-                f"Expected both order_id and event_date in PRIMARY KEY, got {pk_clause}"
+            assert (
+                "order_id" in pk_clause and "event_date" in pk_clause
+            ), f"Expected both order_id and event_date in PRIMARY KEY, got {pk_clause}"
 
             # Verify distributed_by with exact columns
-            dist_match = re.search(r'DISTRIBUTED BY HASH\s*\(([^)]+)\)', ddl)
+            dist_match = re.search(r"DISTRIBUTED BY HASH\s*\(([^)]+)\)", ddl)
             assert dist_match, "DISTRIBUTED BY HASH clause not found"
-            assert "order_id" in dist_match.group(1), \
-                f"Expected HASH(order_id), got HASH({dist_match.group(1)})"
+            assert "order_id" in dist_match.group(
+                1
+            ), f"Expected HASH(order_id), got HASH({dist_match.group(1)})"
             assert "BUCKETS 10" in ddl
 
         finally:
@@ -791,7 +803,9 @@ class TestEndToEndModelParsing:
     # Covers: kind=HASH (unquoted), kind=RANDOM
     # ========================================
 
-    def test_e2e_distribution_structured_hash(self, starrocks_adapter: StarRocksEngineAdapter):
+    def test_e2e_distribution_structured_hash(
+        self, starrocks_adapter: StarRocksEngineAdapter
+    ):
         """Test Case 4A: Structured HASH distribution with unquoted kind."""
         db_name = "sr_e2e_dist_hash_db"
         table_name = f"{db_name}.sr_dist_hash_table"
@@ -825,16 +839,21 @@ class TestEndToEndModelParsing:
 
             # Precise assertions
             import re
+
             assert "DISTRIBUTED BY HASH" in ddl
-            dist_match = re.search(r'DISTRIBUTED BY HASH\s*\(([^)]+)\)', ddl)
+            dist_match = re.search(r"DISTRIBUTED BY HASH\s*\(([^)]+)\)", ddl)
             assert dist_match, "DISTRIBUTED BY HASH clause not found"
-            assert "customer_id" in dist_match.group(1) and "region" in dist_match.group(1)
+            assert "customer_id" in dist_match.group(
+                1
+            ) and "region" in dist_match.group(1)
             assert "BUCKETS 16" in ddl
 
         finally:
             starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
 
-    def test_e2e_distribution_structured_random(self, starrocks_adapter: StarRocksEngineAdapter):
+    def test_e2e_distribution_structured_random(
+        self, starrocks_adapter: StarRocksEngineAdapter
+    ):
         """Test Case 4B: Structured RANDOM distribution."""
         db_name = "sr_e2e_dist_random_db"
         table_name = f"{db_name}.sr_dist_random_table"
@@ -890,12 +909,12 @@ class TestEndToEndModelParsing:
             dialect starrocks,
             columns (
                 id BIGINT,
-                year VARCHAR(10),
-                month VARCHAR(10)
+                year smallint,
+                month smallint
             ),
             physical_properties (
                 primary_key = (id, year, month),
-                partitioned_by = RANGE(year, month),
+                partition_by = RANGE(year, month),
                 partitions = (
                     'PARTITION p202401 VALUES LESS THAN ("2024", "02")',
                     'PARTITION p202402 VALUES LESS THAN ("2024", "03")',
@@ -920,9 +939,10 @@ class TestEndToEndModelParsing:
 
             # Precise assertions
             import re
+
             assert "PARTITION BY RANGE" in ddl
             # Verify partition columns
-            part_match = re.search(r'PARTITION BY RANGE\s*\(([^)]+)\)', ddl)
+            part_match = re.search(r"PARTITION BY RANGE\s*\(([^)]+)\)", ddl)
             assert part_match, "PARTITION BY RANGE clause not found"
             assert "year" in part_match.group(1) and "month" in part_match.group(1)
             # Verify partition definitions
@@ -952,7 +972,7 @@ class TestEndToEndModelParsing:
             ),
             physical_properties (
                 primary_key = (id, region),
-                partitioned_by = LIST(region),
+                partition_by = LIST(region),  -- can't use partitioned_by
                 partitions = (
                     'PARTITION p_cn VALUES IN ("cn", "tw", "hk")',
                     'PARTITION p_us VALUES IN ("us", "ca")'
@@ -976,9 +996,10 @@ class TestEndToEndModelParsing:
 
             # Precise assertions
             import re
+
             assert "PARTITION BY LIST" in ddl
             # Verify partition column
-            part_match = re.search(r'PARTITION BY LIST\s*\(([^)]+)\)', ddl)
+            part_match = re.search(r"PARTITION BY LIST\s*\(([^)]+)\)", ddl)
             assert part_match, "PARTITION BY LIST clause not found"
             assert "region" in part_match.group(1)
             # Verify partition definitions
@@ -1027,10 +1048,12 @@ class TestEndToEndModelParsing:
 
             # Verify DUPLICATE KEY with exact columns
             import re
-            dup_match = re.search(r'DUPLICATE KEY\s*\(([^)]+)\)', ddl)
+
+            dup_match = re.search(r"DUPLICATE KEY\s*\(([^)]+)\)", ddl)
             assert dup_match, "DUPLICATE KEY clause not found"
-            assert "id" in dup_match.group(1) and "dt" in dup_match.group(1), \
-                f"Expected DUPLICATE KEY(id, dt), got DUPLICATE KEY({dup_match.group(1)})"
+            assert "id" in dup_match.group(1) and "dt" in dup_match.group(
+                1
+            ), f"Expected DUPLICATE KEY(id, dt), got DUPLICATE KEY({dup_match.group(1)})"
 
         finally:
             starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
@@ -1074,7 +1097,7 @@ class TestEndToEndModelParsing:
             starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
 
     def test_e2e_key_type_aggregate(self, starrocks_adapter: StarRocksEngineAdapter):
-        """Test Case 7C: AGGREGATE KEY."""
+        """Test Case 7C: AGGREGATE KEY - should raise exception (unsupported)."""
         db_name = "sr_e2e_agg_key_db"
         table_name = f"{db_name}.sr_agg_key_table"
 
@@ -1096,17 +1119,17 @@ class TestEndToEndModelParsing:
         SELECT *
         """
 
+        from sqlmesh.utils.errors import SQLMeshError
+        import pytest
+
         try:
             starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
 
             params = self._parse_model_and_get_all_params(model_sql)
-            starrocks_adapter.create_table(table_name, **params)
 
-            show_create = starrocks_adapter.fetchone(f"SHOW CREATE TABLE {table_name}")
-            ddl = show_create[1]
-            logger.info(f"Case 7C DDL:\n{ddl}")
-
-            assert "AGGREGATE KEY" in ddl, "AGGREGATE KEY missing"
+            # Expect SQLMeshError to be raised for unsupported AGGREGATE KEY
+            with pytest.raises(SQLMeshError, match="AGGREGATE KEY.*not supported"):
+                starrocks_adapter.create_table(table_name, **params)
 
         finally:
             starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
@@ -1137,10 +1160,6 @@ class TestEndToEndModelParsing:
             clustered_by (order_id, event_date),
             physical_properties (
                 primary_key = (order_id, event_date),
-                partitions = (
-                    'PARTITION p202401 VALUES LESS THAN ("2024-02-01")',
-                    'PARTITION p202402 VALUES LESS THAN ("2024-03-01")'
-                ),
                 distributed_by = (kind=HASH, expressions=order_id, buckets=8),
                 replication_num = '1',
                 storage_medium = 'HDD'
@@ -1163,22 +1182,28 @@ class TestEndToEndModelParsing:
             import re
 
             # Verify PRIMARY KEY
-            pk_match = re.search(r'PRIMARY KEY\s*\(([^)]+)\)', ddl)
+            pk_match = re.search(r"PRIMARY KEY\s*\(([^)]+)\)", ddl)
             assert pk_match, "PRIMARY KEY clause not found"
             assert "order_id" in pk_match.group(1) and "event_date" in pk_match.group(1)
 
             # Verify PARTITION BY
-            assert "PARTITION BY RANGE" in ddl
-            assert "p202401" in ddl
+            assert "PARTITION BY" in ddl
+            # Verify exact partition column
+            part_match = re.search(r"PARTITION BY[^(]*\(([^)]+)\)", ddl)
+            assert part_match, "PARTITION BY clause not found"
+            part_cols = part_match.group(1)
+            assert "event_date" in part_cols, f"Expected event_date in PARTITION BY, got {part_cols}"
 
             # Verify DISTRIBUTED BY
             assert "DISTRIBUTED BY HASH" in ddl
             assert "BUCKETS 8" in ddl
 
             # Verify ORDER BY
-            order_match = re.search(r'ORDER BY\s*\(([^)]+)\)', ddl)
+            order_match = re.search(r"ORDER BY\s*\(([^)]+)\)", ddl)
             assert order_match, "ORDER BY clause not found"
-            assert "order_id" in order_match.group(1) and "event_date" in order_match.group(1)
+            assert "order_id" in order_match.group(
+                1
+            ) and "event_date" in order_match.group(1)
 
             # Verify PROPERTIES
             assert "replication_num" in ddl

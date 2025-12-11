@@ -16,6 +16,12 @@
 | **DELETE WHERE** | Basic support | ✅ Enhanced (needs WHERE cleaning) | More complex |
 | **Total overrides** | 7 methods | 5 methods (+ 3 helpers) | Cleaner code |
 
+## 🚧 Limitations
+
+### AGGREGATE KEY Not Supported
+
+AGGREGATE KEY tables require specifying aggregation functions (SUM/MAX/MIN/REPLACE) at the column level, which is not supported in SQLMesh's model syntax. Use PRIMARY KEY or DUPLICATE KEY instead. If attempted, SQLMesh will raise a clear error with alternatives.
+
 ## 📋 Quick Reference: Hierarchical Function Call Map
 
 ```
