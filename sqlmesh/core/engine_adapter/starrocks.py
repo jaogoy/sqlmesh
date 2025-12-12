@@ -1707,6 +1707,61 @@ class StarRocksEngineAdapter(
     # StarRocks supports CREATE/DROP SCHEMA the same as CREATE/DROP DATABSE.
     # So, no need to implement create_schema / drop_schema
 
+    # ==================== Data Object Query ====================
+
+    def _get_data_objects(
+        self, schema_name: SchemaName, object_names: t.Optional[t.Set[str]] = None
+    ) -> t.List[DataObject]:
+        """
+        Returns all the data objects that exist in the given schema.
+        Uses information_schema tables which are compatible with MySQL protocol.
+
+        StarRocks shares the same information_schema structure with Doris/MySQL,
+        so we use the same implementation.
+
+        Args:
+            schema_name: The schema (database) to query
+            object_names: Optional set of specific table names to filter
+
+        Returns:
+            List of DataObject instances representing tables and views
+        """
+        query = (
+            exp.select(
+                exp.column("table_schema").as_("schema_name"),
+                exp.column("table_name").as_("name"),
+                exp.case()
+                .when(
+                    exp.column("table_type").eq("BASE TABLE"),
+                    exp.Literal.string("table"),
+                )
+                .when(
+                    exp.column("table_type").eq("VIEW"),
+                    exp.Literal.string("view"),
+                )
+                .else_("table_type")
+                .as_("type"),
+            )
+            .from_(exp.table_("tables", db="information_schema"))
+            .where(exp.column("table_schema").eq(to_schema(schema_name).db))
+        )
+        if object_names:
+            # StarRocks may treat information_schema table_name comparisons as case-sensitive.
+            # Use LOWER(table_name) to match case-insensitively.
+            lowered_names = [name.lower() for name in object_names]
+            query = query.where(exp.func("LOWER", exp.column("table_name")).isin(*lowered_names))
+
+        # TODO: MV is not distinguished from View (both are categoried as `VIEW`)
+        df = self.fetchdf(query)
+        return [
+            DataObject(
+                schema=row.schema_name,
+                name=row.name,
+                type=DataObjectType.from_str(row.type),  # type: ignore
+            )
+            for row in df.itertuples()
+        ]
+
     # ==================== Index Operations ====================
 
     def create_index(
@@ -1727,14 +1782,8 @@ class StarRocksEngineAdapter(
 
         This is a known limitation also present in Doris, which incorrectly allows
         CREATE INDEX to be attempted.
-
-        Args:
-            table_name: The name of the target table
-            index_name: The name of the index
-            columns: The list of columns that constitute the index
-            exists: Indicates whether to include the IF NOT EXISTS check
         """
-        logger.info(
+        logger.warning(
             f"Skipping CREATE INDEX {index_name} on {table_name} - "
             "StarRocks does not support standalone CREATE INDEX statements. "
             "PRIMARY KEY provides equivalent indexing for columns: {columns}"
@@ -1746,11 +1795,24 @@ class StarRocksEngineAdapter(
     ) -> None:
         """
         Delete from a table.
-        
-        StarRocks has limitations:
-        1. WHERE TRUE is not supported - use TRUNCATE TABLE instead
-        2. More complex WHERE conditions may have limitations
-        
+
+        StarRocks DELETE limitations by table type:
+
+        PRIMARY KEY tables:
+        - Support complex WHERE conditions (subqueries, BETWEEN, etc.)
+        - No special handling needed
+
+        Other table types (DUPLICATE/UNIQUE/AGGREGATE KEY):
+        - WHERE TRUE not supported → use TRUNCATE TABLE
+        - Boolean literals (TRUE/FALSE) not supported
+        - BETWEEN not supported → convert to >= AND <=
+        - Others not supported:
+            - CAST() not supported in WHERE
+            - Subqueries not supported
+            - ...
+
+        But, I don't know what the table type is.
+
         Args:
             table_name: The table to delete from
             where: The where clause to filter rows to delete
@@ -1758,9 +1820,9 @@ class StarRocksEngineAdapter(
         # Parse where clause if it's a string
         if isinstance(where, str):
             from sqlglot import parse_one
-            where = parse_one(where, dialect=self.dialect)
-        
-        # If no where clause or WHERE TRUE, use TRUNCATE TABLE
+            where: exp.Expression = parse_one(where, dialect=self.dialect)
+
+        # If no where clause or WHERE TRUE, use TRUNCATE TABLE (for all table types)
         if not where or where == exp.true():
             table_expr = exp.to_table(table_name) if isinstance(table_name, str) else table_name
             logger.info(
@@ -1769,21 +1831,40 @@ class StarRocksEngineAdapter(
             )
             self.execute(f"TRUNCATE TABLE {table_expr.sql(dialect=self.dialect, identify=True)}")
             return
-        
-        # For other conditions, use parent implementation
+
+        # For non-PRIMARY KEY tables, apply WHERE clause restrictions
+        # Note: We conservatively apply restrictions to all tables since we can't easily
+        # determine table type at DELETE time. PRIMARY KEY tables will still work with
+        # simplified conditions, while non-PRIMARY KEY tables require them.
+        if isinstance(where, exp.Expression):
+            original_where = where
+            # Remove boolean literals (not supported in any table type)
+            where = self._where_clause_remove_boolean_literals(where)
+            # Convert BETWEEN to >= AND <= (required for DUPLICATE/UNIQUE/AGGREGATE KEY tables)
+            where = self._where_clause_convert_between_to_comparison(where)
+
+            if where != original_where:
+                logger.debug(
+                    f"Converted WHERE clause for StarRocks compatibility:\n"
+                    f"  Original: {original_where.sql(dialect=self.dialect)}\n"
+                    f"  Converted: {where.sql(dialect=self.dialect)}"
+                )
+
+        # Use parent implementation
         super().delete_from(table_name, where)
 
     def _where_clause_remove_boolean_literals(self, expression: exp.Expression) -> exp.Expression:
         """
         Remove TRUE/FALSE boolean literals from WHERE expressions.
 
-        StarRocks doesn't support boolean literals in WHERE clauses.
-        This method simplifies expressions like:
-        - (condition) AND TRUE -> condition
-        - (condition) OR FALSE -> condition
-        - TRUE AND (condition) -> condition
-        - WHERE TRUE -> 1=1 (though this case is handled by TRUNCATE conversion)
-        - WHERE FALSE -> 1=0
+        StarRocks Limitation (except PRIMARY KEY tables):
+        Boolean literals (TRUE/FALSE) are not supported in WHERE clauses.
+
+        This method simplifies expressions:
+        - (condition) AND TRUE / TRUE AND (condition) → condition
+        - (condition) OR FALSE / FALSE OR (condition) → condition
+        - WHERE TRUE → 1=1 (though TRUNCATE is used instead)
+        - WHERE FALSE → 1=0
 
         Args:
             expression: The expression to clean
@@ -1796,7 +1877,7 @@ class StarRocksEngineAdapter(
             if node == exp.true():
                 # Convert TRUE to 1=1
                 return exp.EQ(this=exp.Literal.number(1), expression=exp.Literal.number(1))
-            elif node == exp.false():
+            elif node == exp.false():  # noqa: RET505
                 # Convert FALSE to 1=0
                 return exp.EQ(this=exp.Literal.number(1), expression=exp.Literal.number(0))
 
@@ -1831,9 +1912,14 @@ class StarRocksEngineAdapter(
         """
         Convert BETWEEN expressions to >= AND <= comparisons.
 
-        StarRocks DUPLICATE KEY tables don't support BETWEEN in DELETE statements.
+        StarRocks Limitation (DUPLICATE/UNIQUE/AGGREGATE KEY Tables):
+        BETWEEN is not supported in DELETE WHERE clauses for non-PRIMARY KEY tables.
+
+        PRIMARY KEY tables support BETWEEN, but this conversion is safe for all table types
+        since the converted form (>= AND <=) is semantically equivalent.
+
         This method converts:
-        - col BETWEEN a AND b  ->  col >= a AND col <= b
+        - col BETWEEN a AND b  →  col >= a AND col <= b
 
         Args:
             expression: The expression potentially containing BETWEEN

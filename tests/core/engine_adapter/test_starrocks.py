@@ -207,6 +207,245 @@ class TestTableOperations:
 
 
 # =============================================================================
+# WHERE Clause Transformations
+# =============================================================================
+
+
+class TestWhereClauseTransformations:
+    """
+    Tests for WHERE clause transformations in DELETE statements.
+
+    StarRocks has limitations on DELETE WHERE clauses for non-PRIMARY KEY tables:
+    - BETWEEN is not supported → converted to >= AND <=
+    - Boolean literals (TRUE/FALSE) are not supported → removed or converted to 1=1/1=0
+
+    These transformations are applied conservatively to all DELETE statements since
+    table type cannot be easily determined at DELETE time.
+    """
+
+    def test_delete_with_between_simple(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """
+        Test BETWEEN is converted to >= AND <= in DELETE WHERE.
+
+        StarRocks Limitation:
+        BETWEEN is not supported in DELETE WHERE for DUPLICATE/UNIQUE/AGGREGATE KEY tables.
+        """
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        adapter.delete_from(
+            exp.to_table("test_table"),
+            parse_one("dt BETWEEN '2024-01-01' AND '2024-12-31'"),
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert "BETWEEN" not in sql
+        assert "`dt` >= '2024-01-01'" in sql
+        assert "`dt` <= '2024-12-31'" in sql
+        assert "AND" in sql
+
+    def test_delete_with_between_numeric(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Test BETWEEN with numeric values."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        adapter.delete_from(
+            exp.to_table("test_table"),
+            parse_one("id BETWEEN 100 AND 200"),
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert "BETWEEN" not in sql
+        assert "`id` >= 100" in sql
+        assert "`id` <= 200" in sql
+
+    def test_delete_with_between_and_other_conditions(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Test BETWEEN combined with other WHERE conditions."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        # Complex WHERE: id > 50 AND dt BETWEEN '2024-01-01' AND '2024-12-31'
+        adapter.delete_from(
+            exp.to_table("test_table"),
+            parse_one("id > 50 AND dt BETWEEN '2024-01-01' AND '2024-12-31'"),
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert "BETWEEN" not in sql
+        assert "`id` > 50" in sql
+        assert "`dt` >= '2024-01-01'" in sql
+        assert "`dt` <= '2024-12-31'" in sql
+
+    def test_delete_with_multiple_between(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Test multiple BETWEEN expressions in one WHERE clause."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        adapter.delete_from(
+            exp.to_table("test_table"),
+            parse_one("dt BETWEEN '2024-01-01' AND '2024-12-31' AND id BETWEEN 1 AND 100"),
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert "BETWEEN" not in sql
+        assert "`dt` >= '2024-01-01'" in sql
+        assert "`dt` <= '2024-12-31'" in sql
+        assert "`id` >= 1" in sql
+        assert "`id` <= 100" in sql
+
+    def test_delete_with_and_true(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """
+        Test AND TRUE is removed from WHERE clause.
+
+        StarRocks Limitation:
+        Boolean literals are not supported in WHERE clauses.
+        """
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        adapter.delete_from(
+            exp.to_table("test_table"),
+            parse_one("id > 100 AND TRUE"),
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert "TRUE" not in sql
+        assert "`id` > 100" in sql
+        # Should not have extra AND
+        assert sql.count("AND") == 0
+
+    def test_delete_with_true_and_condition(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Test TRUE AND condition (reverse order)."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        adapter.delete_from(
+            exp.to_table("test_table"),
+            parse_one("TRUE AND id > 100"),
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert "TRUE" not in sql
+        assert "`id` > 100" in sql
+
+    def test_delete_with_or_false(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Test OR FALSE is removed from WHERE clause."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        adapter.delete_from(
+            exp.to_table("test_table"),
+            parse_one("id > 100 OR FALSE"),
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert "FALSE" not in sql
+        assert "`id` > 100" in sql
+        assert sql.count("OR") == 0
+
+    def test_delete_with_false_or_condition(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Test FALSE OR condition (reverse order)."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        adapter.delete_from(
+            exp.to_table("test_table"),
+            parse_one("FALSE OR id > 100"),
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert "FALSE" not in sql
+        assert "`id` > 100" in sql
+
+    def test_delete_with_standalone_false(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Test standalone FALSE is converted to 1=0."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        adapter.delete_from(
+            exp.to_table("test_table"),
+            exp.false(),
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert "FALSE" not in sql
+        # Converted to 1=0 (always false condition)
+        assert "1 = 0" in sql or "1=0" in sql
+
+    def test_delete_with_combined_transformations(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """
+        Test BETWEEN + boolean literals together.
+
+        Verifies that multiple transformations work correctly when combined.
+        """
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        # WHERE: dt BETWEEN '2024-01-01' AND '2024-12-31' AND TRUE
+        adapter.delete_from(
+            exp.to_table("test_table"),
+            parse_one("dt BETWEEN '2024-01-01' AND '2024-12-31' AND TRUE"),
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert "BETWEEN" not in sql
+        assert "TRUE" not in sql
+        assert "`dt` >= '2024-01-01'" in sql
+        assert "`dt` <= '2024-12-31'" in sql
+
+    def test_delete_with_nested_boolean_expressions(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Test nested boolean expressions with multiple levels."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        # WHERE: (id > 100 AND TRUE) OR (name = 'test' AND FALSE)
+        # After transformation: id > 100 OR (name = 'test' AND FALSE)
+        # After transformation: id > 100 OR FALSE
+        # After transformation: id > 100
+        adapter.delete_from(
+            exp.to_table("test_table"),
+            parse_one("(id > 100 AND TRUE) OR (name = 'test' AND FALSE)"),
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert "TRUE" not in sql
+        # Note: The AND FALSE cannot be fully simplified without more complex logic
+        # Our transformation only handles direct AND TRUE / OR FALSE at the binary level
+
+    def test_delete_with_between_in_complex_expression(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Test BETWEEN within a complex nested expression."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        adapter.delete_from(
+            exp.to_table("test_table"),
+            parse_one("(dt BETWEEN '2024-01-01' AND '2024-06-30') OR (dt BETWEEN '2024-07-01' AND '2024-12-31')"),
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert "BETWEEN" not in sql
+        # First BETWEEN converted
+        assert "`dt` >= '2024-01-01'" in sql
+        assert "`dt` <= '2024-06-30'" in sql
+        # Second BETWEEN converted
+        assert "`dt` >= '2024-07-01'" in sql
+        assert "`dt` <= '2024-12-31'" in sql
+        assert "OR" in sql
+
+
+# =============================================================================
 # Key Property Building
 # =============================================================================
 
