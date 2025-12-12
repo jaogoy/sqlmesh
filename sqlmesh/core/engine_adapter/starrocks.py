@@ -501,13 +501,13 @@ class FuncType(DeclarativeType):
 # ============================================================
 class AnyOf(DeclarativeType):
     """
-    Union type - accepts first matching sub-type.
+    Union type - accepts first matching subtype.
 
-    This is a combinator type that tries each sub-type in order and accepts
+    This is a combinator type that tries each subtype in order and accepts
     the first one that validates successfully.
 
-    Validation: Tries each sub-type, returns (matched_type, validated_value) tuple.
-    Normalization: Uses the matched sub-type's normalize method.
+    Validation: Tries each subtype, returns (matched_type, validated_value) tuple.
+    Normalization: Uses the matched subtype's normalize method.
     """
 
     def __init__(self, *types: DeclarativeType):
@@ -515,14 +515,14 @@ class AnyOf(DeclarativeType):
             raise ValueError("AnyOf requires at least one type")
 
         # Validate all types are DeclarativeType instances
-        for t in types:
-            if not isinstance(t, DeclarativeType):
-                raise TypeError(f"AnyOf expects DeclarativeType instances, got {t!r}")
+        for type_ in types:
+            if not isinstance(type_, DeclarativeType):
+                raise TypeError(f"AnyOf expects DeclarativeType instances, got {type_!r}")
 
         self.types: t.List[DeclarativeType] = list(types)
 
     def validate(self, value: t.Any) -> t.Optional[t.Tuple[DeclarativeType, Validated]]:
-        """Try each sub-type in order, return (matched_type, validated_value) or None."""
+        """Try each subtype in order, return (matched_type, validated_value) or None."""
         for sub_type in self.types:
             validated = sub_type.validate(value)
             if validated is not None:
@@ -533,7 +533,7 @@ class AnyOf(DeclarativeType):
         return None
 
     def normalize(self, validated: t.Tuple[DeclarativeType, Validated]) -> Normalized:
-        """Normalize using the matched sub-type's normalize method."""
+        """Normalize using the matched subtype's normalize method."""
         matched_type, validated_value = validated
         return matched_type.normalize(validated_value)
 
@@ -814,7 +814,8 @@ class StructuredTupleType(DeclarativeType):
                 if self.error_on_invalid_field:
                     raise ValueError(
                         f"Invalid value for field '{canonical_name}': {value_expr}. "
-                        f"Expected type: {field_spec.type.__class__.__name__}"
+                        f"Expected type: {field_spec.type.__class__.__name__}, "
+                        f"Actual type: {type(value_expr).__name__}"
                     )
                 # Return None for entire validation
                 return None
@@ -1103,6 +1104,7 @@ class PropertySpecs():
     # Accepts:
     # - Single column: id
     # - Multiple columns: (id, dt)
+    # - String for string input: "id, dt" (will be auto-wrapped and parsed by preprocess_parentheses)
     GeneralColumnListInputSpec = SequenceOf(
         ColumnType(),
         StringType(normalized_type="column"),
@@ -1357,7 +1359,7 @@ class PropertyValidator:
             value: Input value (string, expression, or other)
 
         Returns:
-            - For strings: wrapped in parentheses if not already
+            - For strings/Literal/Column(quoted): wrapped in parentheses if not already
             - For other types: returned unchanged
 
         Example:
@@ -1365,10 +1367,19 @@ class PropertyValidator:
             '(id1, id2)'
             >>> PropertyValidator.ensure_parenthesized('(id1, id2)')
             '(id1, id2)'
+            >>> PropertyValidator.ensure_parenthesized(exp.Literal.string('id1, id2'))
+            '(id1, id2)'
+            >>> PropertyValidator.ensure_parenthesized(exp.Column(quoted=True, name='id1, id2'))
+            '(id1, id2)'
         """
         # logger.debug("ensure_parenthesized. value: %s, type: %s", value, type(value))
+
+        # Extract string content from Literal
         if isinstance(value, exp.Literal) and value.is_string:
             value = value.this
+        # Extract string content from Column (quoted)
+        elif isinstance(value, exp.Column) and hasattr(value.this, 'quoted') and value.this.quoted:
+            value = value.name  # Column.name returns the string
         elif not isinstance(value, str):
             return value
 
@@ -1415,6 +1426,8 @@ class PropertyValidator:
             >>> validated = PropertyValidator.validate_and_normalize_property("distributed_by", "RANDOM")
             >>> # Result: "RANDOM" (string from EnumType)
         """
+        logger.debug("validate_and_normalize_property. value: %s, type: %s", value, type(value))
+
         # Step 1: Optionally preprocess string with parentheses
         if preprocess_parentheses:
             value = PropertyValidator.ensure_parenthesized(value)
@@ -2270,17 +2283,17 @@ class StarRocksEngineAdapter(
         partition_kind, partition_cols = self._parse_partition_expressions(partitioned_by)
         logger.debug("_build_partition_property: partition_kind=%s, partition_cols=%s", partition_kind, partition_cols)
 
-        def extract_column_name(expr: exp.Expression) -> str:
+        def extract_column_name(expr: exp.Expression) -> t.Optional[str]:
             if isinstance(expr, exp.Column):
                 return str(expr.name)
             elif isinstance(expr, (exp.Anonymous, exp.Func)):  # noqa: RET505
-                return str(expr)  # not implemented
+                return None  # not implemented
             else:
                 return str(expr)
 
         # Validate partition columns are in key columns (StarRocks requirement)
         if key_columns:
-            partition_col_names = set(extract_column_name(expr) for expr in partition_cols)
+            partition_col_names = set(extract_column_name(expr) for expr in partition_cols) - {None}
             key_cols_set = set(key_columns)
             not_in_key = partition_col_names - key_cols_set
             if not_in_key:
@@ -2340,7 +2353,8 @@ class StarRocksEngineAdapter(
         parsed_cols: t.List[exp.Expression] = []
         partition_kind: t.Optional[str] = None
 
-        normalized = PropertyValidator.validate_and_normalize_property("partitioned_by", partitioned_by)
+        normalized = PropertyValidator.validate_and_normalize_property("partitioned_by", partitioned_by,
+                preprocess_parentheses=True)
         # Process each normalized expression
         for norm_expr in normalized:
             # Check if it's a RANGE function (exp.Anonymous)
@@ -2533,6 +2547,7 @@ class StarRocksEngineAdapter(
         import re
 
         # Only handle string or Literal string values
+        logger.debug("_parse_distribution_with_buckets: distributed_by: %s, type: %s", distributed_by, type(distributed_by))
         if isinstance(distributed_by, str):
             text = distributed_by
         elif isinstance(distributed_by, exp.Literal) and distributed_by.is_string:
@@ -2595,7 +2610,9 @@ class StarRocksEngineAdapter(
             # Get order_by from table_properties (already validated by check_at_most_one)
             order_by = table_properties.pop(order_by_param_name, None)
             if order_by is not None:
-                normalized = PropertyValidator.validate_and_normalize_property("clustered_by", order_by)
+                normalized = PropertyValidator.validate_and_normalize_property(
+                    "clustered_by", order_by, preprocess_parentheses=True
+                )
                 clustered_by = list(normalized)
                 logger.debug("_build_order_by_property: using clustered_by from table_properties[%s]=%s",
                             order_by_param_name, clustered_by)

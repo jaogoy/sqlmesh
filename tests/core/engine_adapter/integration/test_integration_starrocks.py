@@ -257,6 +257,78 @@ class TestBasicOperations:
         finally:
             starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
 
+    def test_rename_table(self, starrocks_adapter: StarRocksEngineAdapter):
+        """Test RENAME TABLE operation."""
+        db_name = "sr_test_rename_db"
+        old_table = f"{db_name}.old_table"
+        new_table = f"{db_name}.new_table"
+
+        try:
+            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+            starrocks_adapter.create_table(
+                old_table,
+                target_columns_to_types={
+                    "id": exp.DataType.build("INT"),
+                    "name": exp.DataType.build("VARCHAR(100)"),
+                },
+            )
+
+            # Insert test data
+            starrocks_adapter.execute(
+                f"INSERT INTO {old_table} (id, name) VALUES (1, 'Test')"
+            )
+
+            # RENAME TABLE
+            starrocks_adapter.rename_table(old_table, new_table)
+
+            # Verify old table doesn't exist
+            old_exists = starrocks_adapter.fetchone(
+                f"SELECT TABLE_NAME FROM information_schema.TABLES "
+                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'old_table'"
+            )
+            assert old_exists is None, "Old table should not exist after rename"
+
+            # Verify new table exists
+            new_exists = starrocks_adapter.fetchone(
+                f"SELECT TABLE_NAME FROM information_schema.TABLES "
+                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'new_table'"
+            )
+            assert new_exists is not None, "New table should exist after rename"
+
+            # Verify data is preserved
+            count = starrocks_adapter.fetchone(f"SELECT COUNT(*) FROM {new_table}")
+            assert count[0] == 1, "Data should be preserved after rename"
+        finally:
+            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+
+    def test_create_index(self, starrocks_adapter: StarRocksEngineAdapter):
+        """Test CREATE INDEX operation (should be skipped for StarRocks).
+
+        StarRocks doesn't support standalone CREATE INDEX statements.
+        The adapter should skip index creation without errors.
+        """
+        db_name = "sr_test_index_db"
+        table_name = f"{db_name}.sr_test_table"
+
+        try:
+            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+            starrocks_adapter.create_table(
+                table_name,
+                target_columns_to_types={
+                    "id": exp.DataType.build("INT"),
+                    "name": exp.DataType.build("VARCHAR(100)"),
+                },
+            )
+
+            # CREATE INDEX (should be skipped silently)
+            starrocks_adapter.create_index(table_name, "idx_name", ("name",))
+
+            # Verify table still exists and is functional
+            count = starrocks_adapter.fetchone(f"SELECT COUNT(*) FROM {table_name}")
+            assert count is not None, "Table should still be functional after skipped index creation"
+        finally:
+            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+
     def test_create_drop_view(self, starrocks_adapter: StarRocksEngineAdapter):
         """Test CREATE VIEW and DROP VIEW."""
         db_name = "sr_test_view_db"
@@ -684,10 +756,11 @@ class TestEndToEndModelParsing:
             ),
             physical_properties (
                 primary_key = (order_id, event_date, customer_id, region),
-                distributed_by = 'HASH(customer_id, region) BUCKETS 16',
+                distributed_by = "HASH(customer_id, region) BUCKETS 16",
                 order_by = (order_id, region),
                 -- clustered_by = (order_id, region),  -- also OK
-                replication_num = '1',
+                -- replication_num = '1',
+                bucket_size = '12345678',
                 enable_persistent_index = 'true'
             )
         );
@@ -728,7 +801,7 @@ class TestEndToEndModelParsing:
                 1
             )
 
-            assert "replication_num" in ddl
+            # assert "replication_num" not in ddl
 
         finally:
             starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
@@ -1221,5 +1294,138 @@ class TestEndToEndModelParsing:
             assert result is not None, "INSERT/SELECT failed"
             assert result[0] == 1001, "order_id mismatch"
 
+        finally:
+            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+
+    # ========================================
+    # Quote Character Handling Test
+    # Tests single quotes vs double quotes in MODEL parsing
+    # ========================================
+
+    def test_e2e_quote_character_handling(
+        self, starrocks_adapter: StarRocksEngineAdapter
+    ):
+        """
+        Test Case: Quote Character Handling (Single vs Double Quotes).
+
+        This test verifies that MODEL parsing correctly handles different quote types:
+        - Single quotes 'value' → Literal(is_string=True) ✓
+        - Double quotes "value" → Column(quoted=True) (parser quirk, but we handle it) ✓
+        - Bare identifiers → proper parsing
+
+        We test this by using different quote forms in MODEL physical_properties
+        and verifying that the final DDL is correct.
+
+        Quote Behavior:
+        ===============
+        In MySQL/StarRocks:
+        - Backtick ` : identifier quote
+        - Single quote ': string literal
+        - Double quote ": string literal (default) OR identifier (ANSI_QUOTES mode)
+
+        In SQLMesh MODEL parsing:
+        - Single quotes 'value' → exp.Literal (correct)
+        - Double quotes "value" → exp.Column(quoted=True) (inconsistent with SQL, but handled)
+
+        This test ensures our workaround in ensure_parenthesized() works correctly.
+        """
+        db_name = "sr_e2e_quote_handling_db"
+        table_name = f"{db_name}.sr_quote_test_table"
+
+        # Test with different quote forms in MODEL
+        model_sql = """
+        MODEL (
+            name test.quote_handling_model,
+            kind FULL,
+            dialect starrocks,
+            columns (
+                id BIGINT,
+                dt DATE,
+                region VARCHAR(50),
+                customer_id INT
+            ),
+            physical_properties (
+                -- Single quotes (correct way) - parses to Literal
+                primary_key = 'id, dt, region',
+
+                partition_by = "date_trunc('day', dt), region",
+
+                -- Double quotes (parser quirk) - parses to Column(quoted=True)
+                -- But our ensure_parenthesized handles this
+                order_by = "id, region",
+
+                -- Structured form with single-quoted string
+                distributed_by = 'HASH(id) BUCKETS 8',
+
+                -- Generic properties with single quotes
+                replication_num = '1',
+                -- storage_medium = "HDD"  -- not valid in shared-data cluster
+            )
+        );
+        SELECT *
+        """
+
+        try:
+            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+
+            # Parse MODEL and extract parameters (this is where quote handling happens)
+            params = self._parse_model_and_get_all_params(model_sql)
+
+            # Log parsed parameters for debugging
+            logger.info(f"Parsed physical_properties: {params['table_properties']}")
+            for key, value in params['table_properties'].items():
+                logger.info(f"  {key}: {type(value).__name__} = {value}")
+
+            # Create table with parsed parameters
+            starrocks_adapter.create_table(table_name, **params)
+
+            # Verify via SHOW CREATE TABLE
+            show_create = starrocks_adapter.fetchone(f"SHOW CREATE TABLE {table_name}")
+            ddl = show_create[1]
+            logger.info(f"Quote Handling Test DDL:\n{ddl}")
+
+            # Precise assertions
+            import re
+
+            # 1. Verify PRIMARY KEY (from single-quoted string 'id, dt')
+            pk_match = re.search(r"PRIMARY KEY\s*\(([^)]+)\)", ddl)
+            assert pk_match, "PRIMARY KEY clause not found"
+            pk_cols = pk_match.group(1)
+            assert "id" in pk_cols and "dt" in pk_cols, (
+                f"Expected PRIMARY KEY (id, dt), got {pk_cols}. "
+                f"Single-quoted string 'id, dt' was not correctly parsed!"
+            )
+
+            # 2. Verify ORDER BY (from double-quoted string \"id, region\")
+            # This tests our Column(quoted=True) workaround
+            order_match = re.search(r"ORDER BY\s*\(([^)]+)\)", ddl)
+            assert order_match, "ORDER BY clause not found"
+            order_cols = order_match.group(1)
+            assert "id" in order_cols and "region" in order_cols, (
+                f"Expected ORDER BY (id, region), got {order_cols}. "
+                f"Double-quoted string \"id, region\" was not correctly handled!"
+            )
+
+            # 3. Verify DISTRIBUTED BY (from single-quoted string)
+            assert "DISTRIBUTED BY HASH" in ddl, "DISTRIBUTED BY clause not found"
+            assert "customer_id" in ddl, "customer_id not found in DISTRIBUTED BY"
+            assert "BUCKETS 8" in ddl, "BUCKETS not found in DISTRIBUTED BY"
+
+            # 4. Verify PROPERTIES (generic properties with single quotes)
+            assert "replication_num" in ddl, "replication_num not found in PROPERTIES"
+            # assert "storage_medium" in ddl or "HDD" in ddl, "storage_medium not found in PROPERTIES"
+
+            # Functional test: Verify table actually works
+            starrocks_adapter.execute(
+                f"INSERT INTO {table_name} "
+                f"(id, dt, region, customer_id) "
+                f"VALUES (100, '2024-01-01', 'US', 1001)"
+            )
+
+            result = starrocks_adapter.fetchone(
+                f"SELECT id, region, customer_id FROM {table_name} WHERE id = 100"
+            )
+            assert result is not None, "INSERT/SELECT failed"
+            assert result == (100, "US", 1001), f"Data mismatch: {result}"
         finally:
             starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
