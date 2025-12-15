@@ -63,44 +63,6 @@ def starrocks_adapter(starrocks_connection_config) -> StarRocksEngineAdapter:
     # Cleanup: adapter will auto-close connection
 
 
-@pytest.fixture(autouse=True)
-def cleanup_test_objects(starrocks_adapter: StarRocksEngineAdapter):
-    """
-    Clean up test databases before and after each test.
-
-    Uses pattern-based cleanup: all databases starting with 'sr_' prefix
-    will be dropped. This ensures:
-    1. No orphan databases from failed tests
-    2. No manual cleanup needed
-    3. Each test starts with a clean state
-
-    Note: All test db_names MUST use 'sr_' prefix for automatic cleanup.
-    """
-
-    def cleanup_all_sr_databases():
-        """Drop all databases with 'sr_' prefix."""
-        try:
-            result = starrocks_adapter.fetchall(
-                "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA "
-                "WHERE SCHEMA_NAME LIKE 'sr\\_%'"
-            )
-            for row in result:
-                db_name = row[0]
-                try:
-                    starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
-                    logger.debug(f"Cleaned up database: {db_name}")
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup {db_name}: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to list databases for cleanup: {e}")
-
-    # Cleanup before test
-    cleanup_all_sr_databases()
-
-    yield
-
-    # Cleanup after test
-    cleanup_all_sr_databases()
 
 
 class TestBasicOperations:
@@ -213,9 +175,7 @@ class TestBasicOperations:
                     "id": exp.DataType.build("INT"),
                     "name": exp.DataType.build("VARCHAR(100)"),
                 },
-                table_properties={
-                    "primary_key": "id"
-                },
+                table_properties={"primary_key": "id"},
             )
             starrocks_adapter.execute(
                 f"INSERT INTO {table_name} (id, name) VALUES (1, 'Alice')"
@@ -325,7 +285,9 @@ class TestBasicOperations:
 
             # Verify table still exists and is functional
             count = starrocks_adapter.fetchone(f"SELECT COUNT(*) FROM {table_name}")
-            assert count is not None, "Table should still be functional after skipped index creation"
+            assert (
+                count is not None
+            ), "Table should still be functional after skipped index creation"
         finally:
             starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
 
@@ -712,7 +674,8 @@ class TestEndToEndModelParsing:
             # Verify function expression and column references
             assert (
                 # "from_unixtime" in part_cols or "ts" in part_cols
-                "__generated_partition_column_" in part_cols and "region" in part_cols
+                "__generated_partition_column_" in part_cols
+                and "region" in part_cols
             ), f"Expected partition expression with generated column/region, got {part_cols}"
 
             # Verify ORDER BY from clustered_by
@@ -1265,7 +1228,9 @@ class TestEndToEndModelParsing:
             part_match = re.search(r"PARTITION BY[^(]*\(([^)]+)\)", ddl)
             assert part_match, "PARTITION BY clause not found"
             part_cols = part_match.group(1)
-            assert "event_date" in part_cols, f"Expected event_date in PARTITION BY, got {part_cols}"
+            assert (
+                "event_date" in part_cols
+            ), f"Expected event_date in PARTITION BY, got {part_cols}"
 
             # Verify DISTRIBUTED BY
             assert "DISTRIBUTED BY HASH" in ddl
@@ -1373,7 +1338,7 @@ class TestEndToEndModelParsing:
 
             # Log parsed parameters for debugging
             logger.info(f"Parsed physical_properties: {params['table_properties']}")
-            for key, value in params['table_properties'].items():
+            for key, value in params["table_properties"].items():
                 logger.info(f"  {key}: {type(value).__name__} = {value}")
 
             # Create table with parsed parameters
@@ -1403,7 +1368,7 @@ class TestEndToEndModelParsing:
             order_cols = order_match.group(1)
             assert "id" in order_cols and "region" in order_cols, (
                 f"Expected ORDER BY (id, region), got {order_cols}. "
-                f"Double-quoted string \"id, region\" was not correctly handled!"
+                f'Double-quoted string "id, region" was not correctly handled!'
             )
 
             # 3. Verify DISTRIBUTED BY (from single-quoted string)
@@ -1427,5 +1392,633 @@ class TestEndToEndModelParsing:
             )
             assert result is not None, "INSERT/SELECT failed"
             assert result == (100, "US", 1001), f"Data mismatch: {result}"
+        finally:
+            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+
+
+# ==================== StarRocks Native SQL Capabilities ====================
+
+
+class TestStarRocksAbility:
+    """
+    Test StarRocks native SQL capabilities and limitations.
+
+    This test class validates StarRocks database features by executing
+    raw SQL statements directly, without going through SQLMesh abstraction layers.
+
+    Purpose:
+    - Document which SQL features are supported
+    - Verify expected failures for unsupported operations
+    - Guide adapter implementation decisions
+
+    Note: Tests marked with @pytest.mark.xfail are EXPECTED to fail.
+    """
+
+    @pytest.fixture(scope="class")
+    def test_tables(
+        self, starrocks_adapter: StarRocksEngineAdapter
+    ) -> t.Dict[str, str]:
+        """
+        Pre-create tables of different types for testing.
+
+        Returns:
+            Dict mapping table type to fully qualified table name
+        """
+        db_name = "sr_ability_test"
+        starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+
+        tables = {}
+
+        # 1. PRIMARY KEY table
+        # Note: StarRocks PRIMARY KEY tables support complex DELETE operations (BETWEEN, subqueries, etc.)
+        pk_table = f"{db_name}.pk_table"
+        starrocks_adapter.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {pk_table} (
+                id INT,
+                dt DATE,
+                name STRING,
+                status STRING
+            ) PRIMARY KEY (id, dt)
+            DISTRIBUTED BY HASH(id) BUCKETS 10
+        """
+        )
+        # Verify table creation
+        result = starrocks_adapter.fetchone(
+            f"SELECT COUNT(*) FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'pk_table'"
+        )
+        assert result[0] == 1, f"PRIMARY KEY table {pk_table} creation failed"
+        tables["primary_key"] = pk_table
+
+        # 2. DUPLICATE KEY table
+        dup_table = f"{db_name}.dup_table"
+        starrocks_adapter.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {dup_table} (
+                id INT,
+                dt DATE,
+                name STRING,
+                status STRING
+            ) DUPLICATE KEY (id, dt)
+            DISTRIBUTED BY HASH(id) BUCKETS 10
+        """
+        )
+        # Verify table creation
+        result = starrocks_adapter.fetchone(
+            f"SELECT COUNT(*) FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'dup_table'"
+        )
+        assert result[0] == 1, f"DUPLICATE KEY table {dup_table} creation failed"
+        tables["duplicate_key"] = dup_table
+
+        # 3. UNIQUE KEY table
+        unique_table = f"{db_name}.unique_table"
+        starrocks_adapter.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {unique_table} (
+                id INT,
+                dt DATE,
+                name STRING,
+                status STRING
+            ) UNIQUE KEY (id, dt)
+            DISTRIBUTED BY HASH(id) BUCKETS 10
+        """
+        )
+        # Verify table creation
+        result = starrocks_adapter.fetchone(
+            f"SELECT COUNT(*) FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'unique_table'"
+        )
+        assert result[0] == 1, f"UNIQUE KEY table {unique_table} creation failed"
+        tables["unique_key"] = unique_table
+
+        yield tables
+
+        # Cleanup
+        starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+
+    # ==================== Schema Operations ====================
+
+    @pytest.mark.parametrize("sql_keyword", ["SCHEMA", "DATABASE"])
+    def test_create_drop_keyword_support(
+        self, starrocks_adapter: StarRocksEngineAdapter, sql_keyword: str
+    ):
+        """
+        Test both CREATE SCHEMA and CREATE DATABASE syntax.
+
+        Expected: Both keywords should work (they are synonyms in StarRocks)
+        """
+        test_name = f"sr_ability_{sql_keyword.lower()}"
+
+        try:
+            # CREATE
+            starrocks_adapter.execute(f"CREATE {sql_keyword} IF NOT EXISTS {test_name}")
+            result = starrocks_adapter.fetchone(
+                f"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{test_name}'"
+            )
+            assert result is not None, f"CREATE {sql_keyword} failed"
+
+            # DROP
+            starrocks_adapter.execute(f"DROP {sql_keyword} IF EXISTS {test_name}")
+            result = starrocks_adapter.fetchone(
+                f"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{test_name}'"
+            )
+            assert result is None, f"DROP {sql_keyword} failed"
+
+        finally:
+            starrocks_adapter.execute(f"DROP {sql_keyword} IF EXISTS {test_name}")
+
+    # ==================== DELETE Operations - Success Cases ====================
+
+    @pytest.mark.parametrize(
+        "table_type,delete_clause,expected_remaining",
+        [
+            # PRIMARY KEY table - full support
+            ("primary_key", "WHERE id = 1", 2),
+            ("primary_key", "WHERE dt BETWEEN '2024-01-01' AND '2024-06-30'", 1),
+            (
+                "primary_key",
+                "WHERE id IN (SELECT id FROM {table} WHERE status = 'deleted')",
+                2,
+            ),
+            ("primary_key", "WHERE TRUE", 0),
+            # PRIMARY KEY with USING (JOIN delete)
+            (
+                "primary_key",
+                "USING {table} t2 WHERE {table}.id = t2.id AND t2.status = 'deleted'",
+                2,
+            ),
+            # DUPLICATE/UNIQUE KEY - only simple WHERE
+            ("duplicate_key", "WHERE id = 1", 2),
+            ("unique_key", "WHERE id = 1", 2),
+        ],
+        ids=[
+            "pk_simple_where",
+            "pk_between",
+            "pk_subquery",
+            "pk_where_true",
+            "pk_using_join",
+            "dup_simple_where",
+            "unique_simple_where",
+        ],
+    )
+    def test_delete_supported_syntax(
+        self,
+        starrocks_adapter: StarRocksEngineAdapter,
+        test_tables: t.Dict[str, str],
+        table_type: str,
+        delete_clause: str,
+        expected_remaining: int,
+    ):
+        """
+        Test DELETE operations that should succeed.
+
+        Expected: DELETE succeeds and leaves expected number of rows
+        """
+        table_name = test_tables[table_type]
+
+        # Prepare test data for this specific test (better isolation)
+        # All tables have the same column structure: (id, dt, name, status)
+        test_data = """
+            (1, '2024-01-15', 'Alice', 'active'),
+            (2, '2024-06-10', 'Bob', 'deleted'),
+            (3, '2024-12-05', 'Charlie', 'active')
+        """
+        starrocks_adapter.execute(f"TRUNCATE TABLE {table_name}")
+        starrocks_adapter.execute(f"INSERT INTO {table_name} VALUES {test_data}")
+
+        # Format delete clause (for subquery/using with table reference)
+        delete_sql = (
+            f"DELETE FROM {table_name} {delete_clause.format(table=table_name)}"
+        )
+
+        # Debug: Log the SQL before execution
+        logger.info(f"Executing DELETE SQL: {delete_sql}")
+
+        # Execute delete
+        starrocks_adapter.execute(delete_sql)
+
+        # Verify result
+        count = starrocks_adapter.fetchone(f"SELECT COUNT(*) FROM {table_name}")[0]
+        logger.info(
+            f"After DELETE: {count} rows remaining (expected {expected_remaining})"
+        )
+        assert (
+            count == expected_remaining
+        ), f"Expected {expected_remaining} rows, got {count} for {table_type} with {delete_clause}"
+
+    # ==================== DELETE Operations - Failure Cases ====================
+
+    syntax_error = "not supported|syntax error|getting analyzing error"
+
+    @pytest.mark.parametrize(
+        "table_type,delete_clause,error_pattern",
+        [
+            # DUPLICATE KEY - unsupported syntax
+            (
+                "duplicate_key",
+                "WHERE dt BETWEEN '2024-01-01' AND '2024-12-31'",
+                syntax_error,
+            ),
+            (
+                "duplicate_key",
+                "WHERE id IN (SELECT id FROM {table} WHERE status = 'deleted')",
+                syntax_error,
+            ),
+            ("duplicate_key", "WHERE TRUE", syntax_error),
+            # UNIQUE KEY - unsupported syntax
+            (
+                "unique_key",
+                "WHERE dt BETWEEN '2024-01-01' AND '2024-12-31'",
+                syntax_error,
+            ),
+            ("unique_key", "WHERE id IN (SELECT id FROM {table})", syntax_error),
+        ],
+        ids=[
+            "dup_between_unsupported",
+            "dup_subquery_unsupported",
+            "dup_where_true_unsupported",
+            "unique_between_unsupported",
+            "unique_subquery_unsupported",
+        ],
+    )
+    def test_delete_unsupported_syntax(
+        self,
+        starrocks_adapter: StarRocksEngineAdapter,
+        test_tables: t.Dict[str, str],
+        table_type: str,
+        delete_clause: str,
+        error_pattern: str,
+    ):
+        """
+        Test DELETE operations that should fail on non-PRIMARY KEY tables.
+
+        Expected: DELETE fails with specific error message.
+        """
+        table_name = test_tables[table_type]
+        delete_sql = (
+            f"DELETE FROM {table_name} {delete_clause.format(table=table_name)}"
+        )
+
+        # This should raise an exception
+        with pytest.raises(Exception) as exc_info:
+            starrocks_adapter.execute(delete_sql)
+
+        # Verify error message matches expected pattern
+        import re
+
+        error_msg = str(exc_info.value).lower()
+        assert re.search(
+            error_pattern, error_msg
+        ), f"Expected error pattern '{error_pattern}', got: {exc_info.value}"
+
+    # ==================== COMMENT Syntax Tests ====================
+
+    @pytest.mark.parametrize(
+        "comment_type,sql_template",
+        [
+            # Table comment variants
+            ("table_standard", "ALTER TABLE {table} COMMENT = '{comment}'"),
+            # Failed without `=`
+            # ("table_standard", "ALTER TABLE {table} COMMENT '{comment}'"),
+            # No MODIFY keyworkd
+            # ("table_modify", 'ALTER TABLE {table} MODIFY COMMENT "{comment}"'),
+            # # Column comment variants
+            (
+                "column_no_type",
+                "ALTER TABLE {table} MODIFY COLUMN {column} COMMENT '{comment}'",
+            ),
+            # it will take some time to change the column type
+            # ("column_with_type", "ALTER TABLE {table} MODIFY COLUMN {column} BIGINT COMMENT '{comment}'"),
+        ],
+        ids=[
+            "table_comment_standard",
+            # "table_comment_standard_without_equal",  # FAIL
+            # "table_comment_modify",  # FAIL
+            "column_comment_no_type",
+            # "column_comment_with_type",
+        ],
+    )
+    def test_comment_syntax_variants(
+        self,
+        starrocks_adapter: StarRocksEngineAdapter,
+        comment_type: str,
+        sql_template: str,
+    ):
+        """
+        Test different COMMENT syntax variations to determine StarRocks support.
+
+        Purpose: Guide whether we need to override comment methods in adapter
+        """
+        db_name = "sr_ability_comment"
+        table_name = f"{db_name}.test_comment"
+
+        try:
+            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+            starrocks_adapter.execute(
+                f"""
+                CREATE TABLE {table_name} (
+                    id INT,
+                    col1 INT
+                )
+                DUPLICATE KEY (id)  -- key columns can't be changed.
+                DISTRIBUTED BY HASH(id) BUCKETS 10
+            """
+            )
+
+            # Generate SQL based on template
+            if "table" in comment_type:
+                sql = sql_template.format(
+                    table=table_name, comment=f"test {comment_type}"
+                )
+            else:  # column
+                sql = sql_template.format(
+                    table=table_name, column="col1", comment=f"test {comment_type}"
+                )
+
+            # Try to execute
+            try:
+                starrocks_adapter.execute(sql)
+
+                # Verify comment was set
+                if "table" in comment_type:
+                    result = starrocks_adapter.fetchone(
+                        f"SELECT TABLE_COMMENT FROM information_schema.TABLES "
+                        f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'test_comment'"
+                    )[0]
+                    assert (
+                        f"test {comment_type}" in result
+                    ), f"Comment not set correctly for {comment_type}"
+                else:  # column
+                    result_row = starrocks_adapter.fetchone(
+                        f"SELECT COLUMN_NAME, COLUMN_COMMENT FROM information_schema.COLUMNS "
+                        f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'test_comment' "
+                        f"AND COLUMN_NAME = 'col1'"
+                    )
+                    logger.info(f"Column comment: {result_row}")
+                    result = result_row[1]
+                    assert (
+                        f"test {comment_type}" in result
+                    ), f"Comment not set correctly for {comment_type}"
+
+                logger.info(f"✅ {comment_type}: SUPPORTED")
+
+            except Exception as e:
+                logger.warning(f"❌ {comment_type}: NOT SUPPORTED - {e}")
+                # Re-raise for test failure
+                raise
+
+        finally:
+            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+
+    # ==================== Quote Type Tests ====================
+
+    @pytest.mark.parametrize(
+        "quote_type,comment_value",
+        [
+            ("single", "single quotes"),
+            ("double", "double quotes"),
+            ("escaped_single", "It\\'s a test"),
+            ("escaped_double", 'Say \\"hello\\"'),
+        ],
+        ids=["single_quotes", "double_quotes", "escaped_single", "escaped_double"],
+    )
+    def test_comment_quote_types(
+        self,
+        starrocks_adapter: StarRocksEngineAdapter,
+        quote_type: str,
+        comment_value: str,
+    ):
+        """
+        Test different quote types in COMMENT clauses.
+
+        Purpose: Determine which quote types StarRocks accepts
+        """
+        db_name = "sr_ability_quotes"
+        table_name = f"{db_name}.test_quotes"
+
+        try:
+            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+            starrocks_adapter.execute(
+                f"""
+                CREATE TABLE {table_name} (id INT)
+                DISTRIBUTED BY HASH(id) BUCKETS 10
+            """
+            )
+
+            # Build SQL with appropriate quotes
+            if "single" in quote_type:
+                sql = f"ALTER TABLE {table_name} COMMENT = '{comment_value}'"
+            else:  # double
+                sql = f'ALTER TABLE {table_name} COMMENT = "{comment_value}"'
+
+            starrocks_adapter.execute(sql)
+            logger.info(f"✅ {quote_type}: SUPPORTED")
+
+        except Exception as e:
+            logger.warning(f"❌ {quote_type}: NOT SUPPORTED - {e}")
+            raise
+
+        finally:
+            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+
+    def test_comment_in_create_table(self, starrocks_adapter: StarRocksEngineAdapter):
+        """
+        Test COMMENT clauses in CREATE TABLE statement.
+
+        Expected: Verify comments are registered during table creation
+        """
+        db_name = "sr_ability_create_comment"
+        table_name = f"{db_name}.test_create_comment"
+
+        try:
+            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+
+            # Create table with comments
+            starrocks_adapter.execute(
+                f"""
+                CREATE TABLE {table_name} (
+                    id INT COMMENT 'id column',
+                    name VARCHAR(100) COMMENT 'name column'
+                )
+                PRIMARY KEY (id)
+                COMMENT 'test table'
+                DISTRIBUTED BY HASH(id) BUCKETS 10
+            """
+            )
+
+            # Verify table comment
+            table_comment = starrocks_adapter.fetchone(
+                f"SELECT TABLE_COMMENT FROM information_schema.TABLES "
+                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'test_create_comment'"
+            )[0]
+            assert (
+                table_comment == "test table"
+            ), f"Table comment mismatch: {table_comment}"
+
+            # Verify column comments
+            column_comments = {}
+            results = starrocks_adapter.fetchall(
+                f"SELECT COLUMN_NAME, COLUMN_COMMENT FROM information_schema.COLUMNS "
+                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'test_create_comment'"
+            )
+            for col_name, col_comment in results:
+                if col_comment:  # Skip empty comments
+                    column_comments[col_name] = col_comment
+
+            assert (
+                column_comments.get("id") == "id column"
+            ), f"Column comment mismatch: {column_comments}"
+            assert (
+                column_comments.get("name") == "name column"
+            ), f"Column comment mismatch: {column_comments}"
+
+        finally:
+            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+
+
+class TestCommentMethods:
+    """
+    Test _build_create_comment_table_exp and _build_create_comment_column_exp methods.
+
+    These methods are used to generate ALTER TABLE SQL for modifying comments.
+    Although StarRocks uses COMMENT_CREATION_TABLE = IN_SCHEMA_DEF_CTAS (comments
+    are included in CREATE TABLE), these methods may be used for:
+    - Modifying existing table comments
+    - View comments (depending on COMMENT_CREATION_VIEW)
+    - Future ALTER TABLE support
+    """
+
+    def test_build_create_comment_table_exp(
+        self, starrocks_adapter: StarRocksEngineAdapter
+    ):
+        """
+        Test _build_create_comment_table_exp generates correct ALTER TABLE COMMENT SQL.
+
+        Verifies:
+        1. Method generates correct SQL syntax
+        2. SQL can be executed successfully
+        3. Comment is actually updated in database
+        """
+        db_name = "sr_test_comment_table"
+        table_name = f"{db_name}.test_table"
+
+        try:
+            # Setup: Create schema and table
+            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+            starrocks_adapter.execute(
+                f"""
+                CREATE TABLE {table_name} (
+                    id INT,
+                    name VARCHAR(100)
+                )
+                PRIMARY KEY (id)
+                COMMENT 'initial comment'
+                DISTRIBUTED BY HASH(id) BUCKETS 10
+            """
+            )
+
+            # Test: Use _build_create_comment_table_exp to generate SQL
+            table_expr = exp.to_table(table_name)
+            new_comment = "Updated table comment via method"
+            comment_sql = starrocks_adapter._build_create_comment_table_exp(
+                table=table_expr, table_comment=new_comment, table_kind="TABLE"
+            )
+
+            # Verify: SQL format is correct
+            assert "ALTER TABLE" in comment_sql, f"Invalid SQL format: {comment_sql}"
+            assert (
+                "COMMENT =" in comment_sql
+            ), f"Missing COMMENT = in SQL: {comment_sql}"
+            assert new_comment in comment_sql, f"Comment not in SQL: {comment_sql}"
+
+            # Execute the generated SQL
+            starrocks_adapter.execute(comment_sql)
+
+            # Verify: Comment was actually updated
+            result = starrocks_adapter.fetchone(
+                f"SELECT TABLE_COMMENT FROM information_schema.TABLES "
+                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'test_table'"
+            )
+            assert result is not None, "Table not found after comment update"
+            assert (
+                result[0] == new_comment
+            ), f"Comment not updated. Expected: {new_comment}, Got: {result[0]}"
+
+            logger.info("✅ _build_create_comment_table_exp generates valid SQL")
+
+        finally:
+            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+
+    def test_build_create_comment_column_exp(
+        self, starrocks_adapter: StarRocksEngineAdapter
+    ):
+        """
+        Test _build_create_comment_column_exp generates correct ALTER TABLE MODIFY COLUMN SQL.
+
+        Verifies:
+        1. Method generates correct SQL with column type
+        2. SQL can be executed successfully
+        3. Column comment is actually updated in database
+        4. Column type is preserved (not changed)
+        """
+        db_name = "sr_test_comment_column"
+        table_name = f"{db_name}.test_table"
+
+        try:
+            # Setup: Create schema and table
+            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+            starrocks_adapter.execute(
+                f"""
+                CREATE TABLE {table_name} (
+                    id INT COMMENT 'initial id comment',
+                    name VARCHAR(100) COMMENT 'initial name comment',
+                    amount DECIMAL(10, 2)
+                )
+                PRIMARY KEY (id)
+                DISTRIBUTED BY HASH(id) BUCKETS 10
+            """
+            )
+
+            # Test: Use _build_create_comment_column_exp to generate SQL
+            table_expr = exp.to_table(table_name)
+            new_comment = "Updated column comment via method"
+            comment_sql = starrocks_adapter._build_create_comment_column_exp(
+                table=table_expr,
+                column_name="name",
+                column_comment=new_comment,
+                table_kind="TABLE",
+            )
+
+            # Verify: SQL format is correct
+            assert "ALTER TABLE" in comment_sql, f"Invalid SQL format: {comment_sql}"
+            assert (
+                "MODIFY COLUMN" in comment_sql
+            ), f"Missing MODIFY COLUMN in SQL: {comment_sql}"
+            assert "COMMENT" in comment_sql, f"Missing COMMENT in SQL: {comment_sql}"
+            assert new_comment in comment_sql, f"Comment not in SQL: {comment_sql}"
+
+            # Execute the generated SQL
+            starrocks_adapter.execute(comment_sql)
+
+            # Verify: Column comment was actually updated
+            result = starrocks_adapter.fetchone(
+                f"SELECT COLUMN_TYPE, COLUMN_COMMENT FROM information_schema.COLUMNS "
+                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'test_table' AND COLUMN_NAME = 'name'"
+            )
+            assert result is not None, "Column not found after comment update"
+            column_type, column_comment = result
+            assert (
+                column_comment == new_comment
+            ), f"Comment not updated. Expected: {new_comment}, Got: {column_comment}"
+            assert (
+                "varchar(100)" in column_type.lower()
+            ), f"Column type changed unexpectedly: {column_type}"
+
+            logger.info(
+                "✅ _build_create_comment_column_exp generates valid SQL with correct type"
+            )
+
         finally:
             starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)

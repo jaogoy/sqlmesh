@@ -1176,6 +1176,143 @@ class TestCommentPropertyBuilding:
         assert "COMMENT 'Test view description'" in sql
         assert "COMMENT 'Column A description'" in sql
 
+    @pytest.mark.parametrize(
+        "table_name,comment,expected_sql",
+        [
+            (
+                "test_table",
+                "Test table comment",
+                "ALTER TABLE `test_table` COMMENT = 'Test table comment'",
+            ),
+            (
+                "db.test_table",
+                "Database qualified table comment",
+                "ALTER TABLE `db`.`test_table` COMMENT = 'Database qualified table comment'",
+            ),
+            (
+                "test_table",
+                "It's a test",
+                None,  # Will check for escaped quote
+            ),
+        ],
+        ids=["simple_table", "qualified_table", "special_chars"],
+    )
+    def test_build_create_comment_table_exp(
+        self,
+        make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter],
+        table_name: str,
+        comment: str,
+        expected_sql: t.Optional[str],
+    ):
+        """
+        Test _build_create_comment_table_exp generates correct ALTER TABLE COMMENT SQL.
+
+        Verifies:
+        1. SQL format: ALTER TABLE {table} COMMENT = '{comment}'
+        2. No MODIFY keyword (StarRocks uses direct COMMENT =)
+        3. Comment is properly quoted
+        4. Table name is properly quoted
+        5. Special characters are escaped
+        """
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        table = exp.to_table(table_name)
+        sql = adapter._build_create_comment_table_exp(table, comment, "TABLE")
+
+        if expected_sql:
+            assert sql == expected_sql
+        else:
+            # Special chars case - check for escaped quote
+            assert "It\'s a test" in sql or "It''s a test" in sql
+
+        # Common assertions for all cases
+        assert "ALTER TABLE" in sql
+        assert "COMMENT =" in sql
+        assert "MODIFY" not in sql  # StarRocks doesn't use MODIFY for table comments
+
+    def test_build_create_comment_table_exp_truncation(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """
+        Test _build_create_comment_table_exp truncates long comments.
+
+        Verifies comments longer than MAX_TABLE_COMMENT_LENGTH (2048) are truncated.
+        """
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        table = exp.to_table("test_table")
+        long_comment = "x" * 3000  # Longer than MAX_TABLE_COMMENT_LENGTH (2048)
+        sql = adapter._build_create_comment_table_exp(table, long_comment, "TABLE")
+
+        # The comment should be truncated to 2048 characters
+        expected_truncated = "x" * 2048
+        assert expected_truncated in sql
+        assert "xxx" * 1000 not in sql  # Verify it's actually truncated
+
+    @pytest.mark.parametrize(
+        "table_name,column_name,comment,expected_sql",
+        [
+            (
+                "test_table",
+                "test_column",
+                "Test column comment",
+                "ALTER TABLE `test_table` MODIFY COLUMN `test_column` COMMENT 'Test column comment'",
+            ),
+            (
+                "db.test_table",
+                "id",
+                "ID column",
+                "ALTER TABLE `db`.`test_table` MODIFY COLUMN `id` COMMENT 'ID column'",
+            ),
+        ],
+        ids=["simple_table", "qualified_table"],
+    )
+    def test_build_create_comment_column_exp(
+        self,
+        make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter],
+        table_name: str,
+        column_name: str,
+        comment: str,
+        expected_sql: str,
+    ):
+        """
+        Test _build_create_comment_column_exp generates correct ALTER TABLE MODIFY COLUMN SQL.
+
+        Verifies:
+        1. SQL format: ALTER TABLE {table} MODIFY COLUMN {column} COMMENT '{comment}'
+        2. No column type required (StarRocks supports this)
+        3. Comment is properly quoted
+        """
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        table = exp.to_table(table_name)
+        sql = adapter._build_create_comment_column_exp(table, column_name, comment, "TABLE")
+
+        assert sql == expected_sql
+        # Should NOT contain column type
+        assert "VARCHAR" not in sql
+        assert "INT" not in sql
+        assert "BIGINT" not in sql
+
+    def test_build_create_comment_column_exp_truncation(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """
+        Test _build_create_comment_column_exp truncates long comments.
+
+        Verifies comments longer than MAX_COLUMN_COMMENT_LENGTH (255) are truncated.
+        """
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        table = exp.to_table("test_table")
+        long_comment = "y" * 500  # Longer than MAX_COLUMN_COMMENT_LENGTH (255)
+        sql = adapter._build_create_comment_column_exp(table, "test_col", long_comment, "TABLE")
+
+        # The comment should be truncated to 255 characters
+        expected_truncated = "y" * 255
+        assert expected_truncated in sql
+        assert "yyy" * 200 not in sql  # Verify it's actually truncated
+
 
 # =============================================================================
 # Comprehensive Tests

@@ -22,6 +22,34 @@
 
 AGGREGATE KEY tables require specifying aggregation functions (SUM/MAX/MIN/REPLACE) at the column level, which is not supported in SQLMesh's model syntax. Use PRIMARY KEY or DUPLICATE KEY instead. If attempted, SQLMesh will raise a clear error with alternatives.
 
+## ✅ Implementation Status
+
+### Core Features - **COMPLETE**
+
+| Component | Status | Location | Description |
+|-----------|--------|----------|-------------|
+| **Declarative Type System** | ✅ Complete | Lines 33-1095 | Type validators with validate/normalize pattern |
+| **Property Specifications** | ✅ Complete | Lines 1101-1306 | Input/Output specs for all properties |
+| **Property Validation** | ✅ Complete | Lines 1311-1570 | Centralized validation helpers |
+| **Table Creation** | ✅ Complete | Lines 2018-2134 | Column reordering + unified parameter handling |
+| **Table Properties** | ✅ Complete | Lines 2136-2777 | All properties orchestration |
+| **DELETE Operations** | ✅ Complete | Lines 1814-1964 | WHERE clause cleaning + TRUNCATE |
+| **Index Operations** | ✅ Complete | Lines 1782-1812 | No-op with logging |
+| **Schema Operations** | ✅ Base class | N/A | Uses base class (SR supports CREATE SCHEMA) |
+
+### Supported Properties - **COMPLETE**
+
+| Property | Input Types | Status | Notes |
+|----------|------------|--------|-------|
+| `primary_key` | Column list, string | ✅ | POST_SCHEMA location |
+| `duplicate_key` | Column list, string | ✅ | For DUPLICATE KEY tables |
+| `unique_key` | Column list, string | ✅ | For legacy UNIQUE KEY tables |
+| `partitioned_by` | Columns, RANGE(), LIST(), expressions | ✅ | All 3 partition types |
+| `partitions` | List of partition definitions | ✅ | Pre-created partitions |
+| `distributed_by` | Structured tuple, HASH(), RANDOM, strings | ✅ | Complex parsing with BUCKETS |
+| `clustered_by` / `order_by` | Column list | ✅ | Alias support |
+| Generic properties | String, literal, identifier | ✅ | Auto-handled via SPEC |
+
 ## 📋 Quick Reference: Hierarchical Function Call Map
 
 ```
@@ -59,20 +87,26 @@ AGGREGATE KEY tables require specifying aggregation functions (SUM/MAX/MIN/REPLA
    │           │
    │           └📞 super()._create_table_from_columns() [base.py: L736-804]
    │               ├📞 _build_schema_exp()             [base.py: L806-827]
-   │               └📞 _create_table()                 [base.py: L961-997]
-   │                   └📞 _build_create_table_exp()   [base.py: L999-1037]
-   │                       ├✅ _build_table_properties_exp()  [⭐ OVERRIDE - starrocks.py: L477-582]
-   │                       │   │                               [📞 Called by base._build_create_table_exp L1020]
-   │                       │   ├─ Handle DISTRIBUTED BY
-   │                       │   ├─ Handle DUPLICATE/UNIQUE KEY
-   │                       │   ├─ Convert literal properties
-   │                       │   └📞 _properties_to_expressions() [base.py: L2786-2830]
-   │                       │
-   │                       └─ Build exp.Create(...)
-   │
-   └─ Related methods:
-       ├📞 _create_table_comment()      [base.py: L2971-2982]
-       └📞 _create_column_comments()    [base.py: L2993-3009]
+   │               ├📞 _create_table()                 [base.py: L961-997]
+   │               │   └📞 _build_create_table_exp()   [base.py: L999-1037]
+   │               │       ├✅ _build_table_properties_exp()  [⭐ OVERRIDE - starrocks.py: L477-582]
+   │               │       │   │                               [📞 Called by base._build_create_table_exp L1020]
+   │               │       │   ├─ Handle DISTRIBUTED BY
+   │               │       │   ├─ Handle DUPLICATE/UNIQUE KEY
+   │               │       │   ├─ Convert literal properties
+   │               │       │   └📞 _properties_to_expressions() [base.py: L2786-2830]
+   │               │       │
+   │               │       └─ Build exp.Create(...)
+   │               │
+   │               └─ Post-table creation (COMMENT handling):
+   │                   ├─ if COMMENT_CREATION_TABLE.is_comment_command_only:
+   │                   │   ├📞 _create_table_comment()      [base.py: L798]
+   │                   │   │   └🔧 _build_create_comment_table_exp()  [⚠️ Override recommended]
+   │                   │   └📞 _create_column_comments()    [base.py: L804]
+   │                   │       └🔧 _build_create_comment_column_exp() [⚠️ Override recommended]
+   │                   │
+   │                   └─ Note: StarRocks uses IN_SCHEMA_DEF_CTAS, so these are NOT called
+   │                            Comments are included directly in CREATE TABLE via SchemaCommentProperty
 
 ✅ delete_from()                      [⭐ OVERRIDE - starrocks.py: L218-236]
    └─ if WHERE TRUE:
@@ -118,15 +152,6 @@ AGGREGATE KEY tables require specifying aggregation functions (SUM/MAX/MIN/REPLA
      1. Column reordering (key columns must be first)
      2. PRIMARY KEY support (pass to base, don't convert)
 
-   Called by:
-     📞 create_table() [base.py: L684-733]
-
-   Calls:
-     1. 🔧 _extract_and_validate_key_columns()
-     2. 🔧 _reorder_columns_for_key()
-     3. 📞 super()._create_table_from_columns() [base.py: L736-804]
-        └─ This in turn calls _build_table_properties_exp()
-
 ✅ _build_table_properties_exp()      [⭐ OVERRIDE - starrocks.py: L477-582]
    Purpose: Build PROPERTIES clause for CREATE TABLE
    Override Reason:
@@ -134,40 +159,27 @@ AGGREGATE KEY tables require specifying aggregation functions (SUM/MAX/MIN/REPLA
      2. Handle literal properties (replication_num, etc)
      3. Handle DUPLICATE KEY / UNIQUE KEY / PRIMARY KEY
 
-   Called by:
-     📞 _build_create_table_exp() [base.py: L1020-1026]
-        └─ Which is called by _create_table() [base.py: L974-988]
-           └─ Which is called by super()._create_table_from_columns()
+❌ _build_create_comment_table_exp() [base.py: L2962-2969 → ⚠️ Override recommended]
+   Purpose: Build ALTER TABLE COMMENT SQL for table comment modification
+   Override Reason: StarRocks uses non-standard syntax (ALTER TABLE {table} COMMENT = '{comment}')
+   Note: Typically NOT called (StarRocks uses IN_SCHEMA_DEF_CTAS)
 
-   Call Graph:
-     1. Extract distributed_by from table_properties
-        └─ Parse nested Tuple(EQ(kind='HASH'), EQ(expressions=[...]))
-     2. Extract other literal properties
-        └─ Convert exp.Literal to Property expressions
-     3. Build exp.Properties(expressions=[...])
-        ├📞 _properties_to_expressions() [base.py: L2786-2830]
-        └─ Base Generator renders to SQL
+❌ _build_create_comment_column_exp() [base.py: L2984-2991 → ⚠️ Override recommended]
+   Purpose: Build ALTER TABLE MODIFY COLUMN SQL for column comment modification
+   Override Reason: StarRocks requires column type in MODIFY COLUMN statement
+   Note: Typically NOT called (StarRocks uses IN_SCHEMA_DEF_CTAS)
 
-✅ delete_from()                      [starrocks.py: L218-236]
-   Purpose: Handle DELETE operations
+✅ delete_from()                      [⭐ OVERRIDE - starrocks.py: L218-236]
+   Purpose: Handle DELETE operations (WHERE TRUE → TRUNCATE)
    Override Reason: StarRocks doesn't support WHERE TRUE
 
    Called by:
      📞 insert_overwrite_by_time_partition() [base.py: L2193-2289]
      📞 User code / SQLMesh internals
 
-   Logic:
-     if not where or where == exp.true():
-         → execute("TRUNCATE TABLE {table_name}")
-     else:
-         → 📞 super().delete_from(table_name, where)
-
-✅ execute()                          [starrocks.py: L238-280]
+✅ execute()                          [⭐ OVERRIDE - starrocks.py: L238-280]
    Purpose: Strip FOR UPDATE from queries
    Override Reason: StarRocks OLAP doesn't support row locks
-
-   Called by:
-     📞 All adapter methods that execute SQL
 
    Logic:
      for expression in expressions:
@@ -176,17 +188,14 @@ AGGREGATE KEY tables require specifying aggregation functions (SUM/MAX/MIN/REPLA
                  expression.set("locks", None)  # Remove FOR UPDATE
      📞 super().execute(processed_expressions)
 
-✅ create_index()                     [starrocks.py: L191-216]
-   Purpose: Prevent CREATE INDEX execution
+✅ create_index()                     [⭐ OVERRIDE - starrocks.py: L191-216]
+   Purpose: Prevent CREATE INDEX execution (no-op)
    Override Reason: StarRocks doesn't support standalone indexes
 
    Called by:
      📞 SQLMesh state table initialization
      📞 Model with explicit index definitions
 
-   Logic:
-     logger.info("Skipping CREATE INDEX - use PRIMARY KEY")
-     return  # No-op
 
 ┌─────────────────────────────────────────────────────────────────────┐
 │ LEVEL 3: Helper Methods (Internal Utilities)                       │
@@ -194,7 +203,6 @@ AGGREGATE KEY tables require specifying aggregation functions (SUM/MAX/MIN/REPLA
 
 🔧 _extract_and_validate_key_columns()  [starrocks.py: L683-755]
    Purpose: Extract key definition from table_properties
-   Called by: ✅ _create_table_from_columns()
 
    Input: table_properties dict, primary_key tuple
    Output: (key_type, key_columns)
@@ -208,7 +216,6 @@ AGGREGATE KEY tables require specifying aggregation functions (SUM/MAX/MIN/REPLA
 
 🔧 _expr_to_column_tuple()  [starrocks.py: L757-797]
    Purpose: Normalize key expressions to column name tuple
-   Called by: 🔧 _extract_and_validate_key_columns()
 
    Input: Expression (Tuple | list | Column | str)
    Output: Tuple[str, ...]  # Column names
@@ -221,7 +228,6 @@ AGGREGATE KEY tables require specifying aggregation functions (SUM/MAX/MIN/REPLA
 
 🔧 _reorder_columns_for_key()  [starrocks.py: L799-858]
    Purpose: Reorder columns so key columns come first
-   Called by: ✅ _create_table_from_columns()
 
    Input: columns dict, key_columns tuple, key_type str
    Output: Reordered columns dict
@@ -256,13 +262,11 @@ AGGREGATE KEY tables require specifying aggregation functions (SUM/MAX/MIN/REPLA
    → Uses CREATE TABLE ... LIKE syntax
 
 ❌ _create_table_comment()  [base.py: L2971-2982]
-   → Uses ALTER TABLE MODIFY COMMENT
+   → Uses _build_create_comment_table_exp instead
 
 ❌ _properties_to_expressions() [base.py: L2786-2830]
    → Converts dict properties to exp.Property list
 ```
-
----
 
 ---
 
@@ -528,8 +532,6 @@ def _create_table_from_columns(self, ..., primary_key=None, ...):
     self.execute(create_exp)
 ```
 
-
-
 **StarRocks Implementation**:
 
 ```python
@@ -558,8 +560,6 @@ def _create_table_from_columns(self, ..., primary_key=None, **kwargs):
 1. **No PRIMARY KEY → UNIQUE KEY conversion** (StarRocks supports PRIMARY KEY)
 2. **Column reordering required** (StarRocks constraint)
 3. **Simpler logic** (just reorder and delegate)
-
-
 
 ### DELETE Operations
 
@@ -964,466 +964,61 @@ If it doesn't work, we might need to extend the partition expression parser.
 
 ## 📋 Part 5: Implementation Checklist
 
-### Phase 1: Core Implementation ✅ COMPLETE
+### Phase 1: Core Implementation ✅ **COMPLETE**
+
+**Declarative Type System** (2000+ lines):
+
+- [x] Base `DeclarativeType` with validate/normalize separation
+- [x] Primitive types: String, Literal, Identifier, Column, Eq, Enum, Func
+- [x] Combinators: AnyOf (union), SequenceOf (lists)
+- [x] Structured types: StructuredTupleType, Field definitions
+- [x] Distribution types: DistributionTupleInputType, DistributionTupleOutputType
+
+**Property System**:
+
+- [x] PropertySpecs with INPUT/OUTPUT specifications
+- [x] PropertyValidator with centralized helpers
+- [x] Alias support (partitioned_by/partition_by, clustered_by/order_by)
+- [x] Invalid name checking and error guidance
+- [x] Mutual exclusion validation
+
+**Core Adapter Methods**:
+
+- [x] `_create_table_from_columns()` - column reordering + unified parameter handling
+- [x] `_build_table_properties_exp()` - orchestrates all properties
+- [x] `_build_table_key_property()` - PRIMARY/DUPLICATE/UNIQUE keys
+- [x] `_build_partition_property()` - RANGE/LIST/Expression partitions
+- [x] `_build_distributed_by_property()` - complex distribution parsing
+- [x] `_build_order_by_property()` - clustering with alias support
+- [x] `_build_other_properties()` - generic properties via SPEC
+- [x] `delete_from()` - WHERE clause cleaning + TRUNCATE
+- [x] `execute()` - strip FOR UPDATE
+- [x] `create_index()` - no-op with logging
+- [x] Helper methods: `_extract_and_validate_key_columns()`, `_reorder_columns_for_key()`
+- [x] **Verified**: `create_schema()` works with base class
+
+## 🎯 Next Steps
+
+### Testing (Phase 2)
 
-- [x] Create `starrocks.py` adapter file
-- [x] Implement `_create_table_from_columns()` (PRIMARY KEY + column reordering)
-- [x] Implement `_extract_and_validate_key_columns()` helper
-- [x] Implement `_expr_to_column_tuple()` helper
-- [x] Implement `_reorder_columns_for_key()` helper
-- [x] Implement `_build_table_properties_exp()` (DISTRIBUTED BY, properties)
-- [x] Implement `delete_from()` (WHERE TRUE → TRUNCATE)
-- [x] Implement `execute()` (strip FOR UPDATE)
-- [x] Implement `create_index()` (no-op with warning)
-- [x] Set class attributes (DIALECT, SUPPORTS_*, etc)
-- [x] **Verify**: `create_schema()` works with base class (SR supports CREATE SCHEMA)
-
-### Phase 2: SQLGlot Integration
-
-- [ ] Check if SQLGlot has StarRocks dialect
-- [ ] If not: Create StarRocks dialect (inherit from Doris)
-- [ ] Override PRIMARY KEY generation
-- [ ] Add tests for PRIMARY KEY vs UNIQUE KEY
-- [ ] Test expression partitioning
-- [ ] Submit PR to SQLGlot
-
-### Phase 3: Enhanced Features
-
-- [ ] Add `delete_from()` with subquery support
-- [ ] Add materialized view support
-- [ ] Test partition expressions (date_trunc, etc.)
-- [ ] Add multi-column partitioning tests
-- [ ] Performance optimization
-
-### Phase 4: Documentation & Testing
-
-- [ ] Write comprehensive tests
-- [ ] Document usage examples
-- [ ] Create migration guide from Doris
-- [ ] Add to SQLMesh documentation
-
----
-
-## 🎯 Summary: What You Need to Implement
-
-### In SQLMesh (starrocks.py)
-
-**Mandatory**:
-
-1. ✅ `_create_table_from_columns()` - Already done! (just calls base class)
-2. ⚠️ `create_schema()` - Need to add (use DATABASE keyword)
-3. ⚠️ `drop_schema()` - Need to add (use DATABASE keyword)
-
-**Optional** (can add later):
-4. `delete_from()` - For subquery support
-5. `_build_table_properties_exp()` - If table properties differ from base class
-6. `_create_materialized_view()` - If MV syntax differs
-
-### In SQLGlot (if needed)
-
-**Mandatory**:
-
-1. Create `dialects/starrocks.py` (inherit from Doris)
-2. Override `primarykeycolumnconstraint_sql()` method
-3. Add tests
-
-**Optional**:
-4. Add StarRocks-specific functions
-5. Enhance expression partitioning parser (if base parser doesn't handle it)
-
-### Testing
-
-1. Test PRIMARY KEY table creation
-2. Test UNIQUE KEY table creation (legacy)
-3. Test DUPLICATE KEY table creation
-4. Test PARTITION BY with expressions
-5. Test DISTRIBUTED BY
-6. Test DELETE operations
-
----
-
-## 💡 Key Takeaways
-
-1. **Minimal Override Strategy**: Only override what's different
-   - PRIMARY KEY vs UNIQUE KEY → Override `_create_table_from_columns()`
-   - DATABASE vs SCHEMA → Override `create_schema()`
-   - Everything else → Use base class
-
-2. **Strategy Pattern**: Use class attributes to configure behavior
-   - `INSERT_OVERWRITE_STRATEGY` → No override needed
-   - `SUPPORTS_TRANSACTIONS` → No override needed
-
-3. **SQLGlot Separation**: Most SQL generation is in SQLGlot
-   - Adapter: Orchestrates operations
-   - SQLGlot: Generates SQL syntax
-   - Clean separation of concerns
-
-4. **Expression Partitioning**: Likely already supported
-   - Test first before implementing
-   - SQLGlot's parser is powerful
-
-5. **Incremental Implementation**: Start simple, add features later
-   - MVP: Just PRIMARY KEY support
-   - Phase 2: SQLGlot dialect
-   - Phase 3: Advanced features
-
-| Feature | Doris | StarRocks | Impact |
-|---------|-------|-----------|--------|
-| **Primary Key** | Uses `UNIQUE KEY` | Native `PRIMARY KEY` support | ✅ Major difference - requires different handling |
-| **DELETE Subquery** | Not supported | Supported for Primary Key tables only | ⚠️ Conditional handling needed |
-| **Table Types** | Unique Key, Duplicate, Aggregate | Primary Key (enhanced), Unique, Duplicate, Aggregate | ℹ️ Primary Key replaces Unique Key |
-| **Materialized Views** | ASYNC/SYNC | ASYNC/SYNC (similar syntax) | ✅ Likely same implementation |
-| **DATABASE keyword** | DATABASE | DATABASE | ✅ Same |
-| **information_schema** | MySQL-compatible | MySQL-compatible | ✅ Same |
-| **DISTRIBUTED BY** | HASH/RANDOM | HASH/RANDOM | ✅ Same |
-| **PARTITION BY** | RANGE/LIST | RANGE/LIST | ✅ Same |
-
-## Implementation Strategy
-
-**NOT Inheriting from Doris** - We are creating a standalone adapter that **references** Doris implementation but doesn't inherit.
-
-Reasons:
-
-1. PRIMARY KEY vs UNIQUE KEY is a fundamental difference
-2. Cleaner code without workarounds for inheritance
-3. Easier to maintain separate evolution paths
-4. More explicit about what we support
-
-## File Structure
-
-```plain text
-sqlmesh/core/engine_adapter/
-├── starrocks.py          # Main adapter implementation
-└── doris.py             # Reference implementation
-
-tests/core/engine_adapter/
-└── test_starrocks.py    # Test suite (TODO)
-```
-
-## Implemented Methods
-
-### ✅ Fully Implemented
-
-#### 1. `create_schema()`
-
-- Uses `DATABASE` keyword instead of `SCHEMA`
-- Same as Doris
-- **Status**: Complete
-
-#### 2. `drop_schema()`
-
-- Uses `DATABASE` keyword
-- No CASCADE support
-- Same as Doris
-- **Status**: Complete
-
-#### 3. `_get_data_objects()`
-
-- Uses `information_schema.tables`
-- MySQL-compatible
-- Same as Doris
-- **Status**: Complete
-
-#### 4. `_create_table_from_columns()` ⭐ **KEY DIFFERENCE**
-
-- **StarRocks**: Passes `primary_key` directly to base class
-- **Doris**: Converts `primary_key` to `unique_key` in table_properties
-- **Status**: Complete
-
-```python
-# StarRocks implementation:
-super()._create_table_from_columns(
-    primary_key=primary_key,  # Pass as-is
-    ...
-)
-
-# Doris implementation:
-table_properties["unique_key"] = exp.Tuple(...)  # Convert
-super()._create_table_from_columns(
-    primary_key=None,  # Block base class
-    ...
-)
-```
-
-#### 5. `_build_table_propertiesd_exp()` ⭐ **KEY DIFFERENCE**
-
-- **StarRocks**: Handles PRIMARY KEY natively (via base class)
-- **StarRocks**: Handles UNIQUE KEY from table_properties (legacy Unique Key tables)
-- **Doris**: Only handles UNIQUE KEY (converted from primary_key)
-- **Status**: Complete (simplified version)
-
-Handles:
-
-- PRIMARY KEY (delegated to base class)
-- UNIQUE KEY (for legacy tables)
-- DUPLICATE KEY
-- PARTITION BY RANGE/LIST
-- DISTRIBUTED BY HASH
-- COMMENT
-- Materialized view properties (BUILD, REFRESH)
-
-#### 6. `_parse_partition_expressions()`
-
-- Parses RANGE(col) and LIST(col) syntax
-- Extracts partition kind and column list
-- Same as Doris
-- **Status**: Complete
-
-#### 7. `_build_partitioned_by_exp()`
-
-- Builds PARTITION BY RANGE or LIST expression
-- Same as Doris
-- **Status**: Complete
-
-#### 8. Comment Methods
-
-- `_create_table_comment()`: ALTER TABLE MODIFY COMMENT
-- `_build_create_comment_column_exp()`: ALTER TABLE MODIFY COLUMN ... COMMENT
-- Same as Doris
-- **Status**: Complete
-
-#### 9. `create_table_like()`
-
-- Uses CREATE TABLE ... LIKE syntax
-- Same as Doris
-- **Status**: Complete
-
-### 🚧 Partially Implemented
-
-#### 10. `delete_from()` ⚠️ **CONDITIONAL DIFFERENCE**
-
-- **StarRocks Primary Key tables**: Support subquery
-- **StarRocks Other tables**: Do NOT support subquery
-- **Strategy**: Use USING syntax for all subqueries (conservative, same as Doris)
-- **Status**: Framework complete, helper methods TODO
-
-```python
-# Implementation logic:
-if no_condition:
-    TRUNCATE TABLE
-elif has_subquery:
-    # Use USING syntax (safe for all table types)
-    DELETE FROM t1 USING t2 WHERE t1.id = t2.id
-else:
-    # Standard DELETE (works for all table types)
-    DELETE FROM t WHERE condition
-```
-
-#### 11. `create_view()` / `_create_materialized_view()`
-
-- StarRocks supports ASYNC and SYNC materialized views
-- Syntax similar to Doris but needs verification
-- **Status**: Framework complete, implementation TODO
-
-### ❌ Not Yet Implemented
-
-#### 12. `drop_view()`
-
-- Drop materialized views
-- **Status**: TODO
-
-#### 13. Helper methods for DELETE
-
-- `_find_subquery_in_condition()`
-- `_execute_delete_with_subquery()`
-- **Status**: TODO (copy from Doris)
-
-## SQLGlot Dialect Support
-
-### Current Status
-
-Check if SQLGlot already has StarRocks dialect support:
-
-```python
-from sqlglot import dialects
-print("starrocks" in dialects.Dialects)
-```
-
-### If Not Supported
-
-We can temporarily use Doris dialect with custom handling:
-
-```python
-# In starrocks.py
-DIALECT = "doris"  # Temporarily use Doris dialect
-
-# Generate SQL with explicit dialect
-exp.Create(...).sql(dialect="doris", identify=True)
-```
-
-### Future Enhancement
-
-Create a dedicated StarRocks dialect in SQLGlot:
-
-```python
-# In SQLGlot repository
-from sqlglot.dialects.doris import Doris
-
-class StarRocks(Doris):
-    """StarRocks SQL dialect."""
-
-    class Generator(Doris.Generator):
-        # Override PRIMARY KEY generation
-        def primarykey_sql(self, expression: exp.PrimaryKey) -> str:
-            return f"PRIMARY KEY({self.expressions(expression)})"
-```
-
-## Testing Strategy
-
-### Test Cases to Implement
-
-1. **Table Creation**
-
-   ```python
-   def test_create_table_with_primary_key():
-       # Should generate: CREATE TABLE ... PRIMARY KEY(id)
-
-   def test_create_table_with_unique_key():
-       # Should generate: CREATE TABLE ... UNIQUE KEY(id)
-
-   def test_create_table_with_duplicate_key():
-       # Should generate: CREATE TABLE ... DUPLICATE KEY(id)
-   ```
-
-2. **Partitioning**
-
-   ```python
-   def test_create_table_with_range_partition():
-       # PARTITION BY RANGE(dt) (...)
-
-   def test_create_table_with_list_partition():
-       # PARTITION BY LIST(region) (...)
-   ```
-
-3. **Distribution**
-
-   ```python
-   def test_create_table_with_hash_distribution():
-       # DISTRIBUTED BY HASH(id) BUCKETS 10
-   ```
-
-4. **DELETE Operations**
-
-   ```python
-   def test_delete_simple_condition():
-       # DELETE FROM t WHERE id = 1
-
-   def test_delete_with_subquery():
-       # DELETE FROM t USING (...) WHERE ...
-
-   def test_delete_truncate():
-       # TRUNCATE TABLE t
-   ```
-
-5. **Materialized Views**
-
-   ```python
-   def test_create_async_materialized_view():
-       # CREATE MATERIALIZED VIEW ... REFRESH ASYNC
-
-   def test_create_sync_materialized_view():
-       # CREATE MATERIALIZED VIEW ... (rollup)
-   ```
-
-### Test Environment
-
-- StarRocks 3.3+ (you have 3.5.3 available)
-- SQLMesh test framework
-- Compare against Doris adapter tests
-
-## Next Steps
-
-### Phase 1: Complete Core Methods (Current)
-
-- [x] `_create_table_from_columns()` - PRIMARY KEY support
-- [x] `_build_table_properties_exp()` - Table properties
-- [x] `_parse_partition_expressions()` - Partition parsing
-- [x] `_build_partitioned_by_exp()` - Partition building
-- [ ] `delete_from()` - Complete helper methods
-- [ ] `_create_materialized_view()` - Verify syntax differences
-
-### Phase 2: Testing
-
-- [ ] Write unit tests for table creation
-- [ ] Write unit tests for DELETE operations
 - [ ] Write integration tests with StarRocks 3.5.3
-- [ ] Compare behavior with Doris adapter
+- [ ] Test all table key types (PRIMARY, DUPLICATE, UNIQUE)
+- [ ] Test all partition types (RANGE, LIST, Expression)
+- [ ] Test distribution patterns (HASH with buckets, RANDOM)
+- [ ] Test property alias handling
+- [ ] Compare behavior with expected StarRocks SQL
 
-### Phase 3: Documentation
+### Documentation (Phase 3)
 
-- [ ] Add docstrings with examples
-- [ ] Update SQLMesh documentation
-- [ ] Create migration guide from Doris
+- [ ] Add comprehensive docstring examples
+- [ ] Create user guide with SQLMesh model examples
+- [ ] Document property input formats and validation
 
-### Phase 4: SQLGlot Integration
+### SQLGlot Enhancement (Phase 4)
 
-- [ ] Check current SQLGlot StarRocks support
-- [ ] Submit PR to SQLGlot if needed
-- [ ] Update adapter to use dedicated dialect
-
-### Phase 5: Advanced Features
-
-- [ ] Materialized view refresh strategies
-- [ ] Optimize for Primary Key table features
-- [ ] Support StarRocks-specific functions
-- [ ] Warehouse support (StarRocks 3.3+)
-
-## Reference Implementation Comparison
-
-### Creating a Primary Key Table
-
-**StarRocks Adapter (New)**:
-
-```python
-adapter.create_table(
-    table_name="my_table",
-    columns_to_types={"id": "INT", "name": "VARCHAR(100)"},
-    primary_key=("id",)
-)
-# Generates: CREATE TABLE my_table (id INT, name VARCHAR(100)) PRIMARY KEY(id)
-```
-
-**Doris Adapter (Reference)**:
-
-```python
-adapter.create_table(
-    table_name="my_table",
-    columns_to_types={"id": "INT", "name": "VARCHAR(100)"},
-    primary_key=("id",)
-)
-# Generates: CREATE TABLE my_table (id INT, name VARCHAR(100)) UNIQUE KEY(id)
-```
-
-### Key Code Differences
-
-#### StarRocks `_create_table_from_columns()`
-
-```python
-def _create_table_from_columns(self, ..., primary_key=None, **kwargs):
-    # Pass primary_key directly - base class handles PRIMARY KEY
-    super()._create_table_from_columns(
-        primary_key=primary_key,  # ✅ As-is
-        ...
-    )
-```
-
-#### Doris `_create_table_from_columns()`
-
-```python
-def _create_table_from_columns(self, ..., primary_key=None, **kwargs):
-    table_properties = kwargs.get("table_properties", {})
-
-    # Convert primary_key to unique_key
-    if primary_key:
-        table_properties["unique_key"] = exp.Tuple(...)  # 🔄 Convert
-
-    kwargs["table_properties"] = table_properties
-
-    super()._create_table_from_columns(
-        primary_key=None,  # ❌ Block base class
-        ...
-    )
-```
+- [ ] Verify SQLGlot StarRocks dialect completeness
+- [ ] Test PRIMARY KEY generation in POST_SCHEMA location
+- [ ] Submit PR if improvements needed
 
 ## 🎯 Summary: Key Implementation Points
 
@@ -1464,6 +1059,7 @@ def _create_table_from_columns(self, ..., primary_key=None, **kwargs):
 - `table_exists()`, `columns()`, `fetchall()` - All work as-is
 
 ## 📖 Usage Examples
+
 ## Configuration Examples
 
 ### config.yaml
@@ -1537,6 +1133,7 @@ This repository contains multiple StarRocks implementation documents:
 ### 2024-11-26 - Major Update
 
 **Changes**:
+
 - ✅ Merged latest insights from IMPL_CALL_HIERARCHY_NEW.md
 - ✅ Corrected create_schema()/drop_schema() - NO override needed
 - ✅ Clarified StarRocks is more SQL-standard than Doris
@@ -1545,6 +1142,7 @@ This repository contains multiple StarRocks implementation documents:
 - ✅ Updated all line number references
 
 **Key Corrections**:
+
 1. StarRocks supports both CREATE SCHEMA and CREATE DATABASE (use base class)
 2. Only 5 core overrides needed (not 7 like initially thought)
 3. Column ordering is the critical unique requirement
@@ -1560,17 +1158,20 @@ This repository contains multiple StarRocks implementation documents:
 ## 👥 Contributors & References
 
 **Implementation**:
+
 - Based on Doris adapter by SQLMesh team
 - StarRocks-specific adaptations: Community contributors
 - Testing: In progress
 
 **Important Notes**:
+
 1. **PRIMARY KEY Constraint**: StarRocks PRIMARY KEY tables require partition columns to be in the primary key
 2. **DELETE Performance**: Primary Key tables support efficient DELETE by primary key
 3. **Materialized Views**: StarRocks 3.3+ has enhanced MV capabilities (text-based rewrite, view-based MV)
 4. **Warehouse Feature**: StarRocks 3.3+ introduces warehouse concept for resource isolation
 
 **References**:
+
 - [StarRocks Documentation](https://docs.starrocks.io/)
 - [StarRocks vs Doris Comparison](https://forum.starrocks.io/t/faq-apache-doris-vs-starrocks/128)
 - [StarRocks 3.3 Release Notes](https://docs.starrocks.io/releasenotes/release-3.3/)
