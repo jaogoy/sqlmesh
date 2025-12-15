@@ -25,11 +25,13 @@ import typing as t
 from functools import partial
 
 import pytest
-from sqlglot import exp, parse_one
+from sqlglot import exp
 
 from sqlmesh.core.engine_adapter.starrocks import StarRocksEngineAdapter
 from sqlmesh.core.model.definition import load_sql_based_model
 import sqlmesh.core.dialect as d
+
+from tests.core.engine_adapter.integration import TestContext
 
 # Mark as docker test (can also run against local StarRocks)
 # Remove 'docker' marker if you want to run against local instance only
@@ -37,6 +39,19 @@ pytestmark = [pytest.mark.starrocks, pytest.mark.docker, pytest.mark.engine]
 
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# TestContext-based Integration Tests
+# =============================================================================
+#
+# These tests demonstrate how to use SQLMesh's TestContext helpers in a StarRocks-specific
+# integration file:
+# - Automatic schema isolation via ctx.test_id
+# - Automatic cleanup of created schemas
+#
+# Unlike the shared integration harness (which loads the full gateway config), this local
+# fixture keeps StarRocks tests self-contained and runnable with only StarRocks deps installed.
 
 
 @pytest.fixture(scope="module")
@@ -50,9 +65,47 @@ def starrocks_connection_config() -> t.Dict[str, t.Any]:
     }
 
 
+@pytest.fixture
+def ctx(tmp_path, starrocks_connection_config) -> t.Iterable[TestContext]:
+    """
+    A lightweight TestContext fixture which avoids loading the full integration gateway config.
+
+    This keeps the StarRocks integration tests self-contained (similar to `starrocks_adapter`)
+    while still providing TestContext niceties like:
+    - ctx.table(...) naming + schema isolation
+    - automatic cleanup
+    """
+    from pymysql import connect
+
+    adapter = StarRocksEngineAdapter(partial(connect, **starrocks_connection_config))
+    ctx = TestContext(
+        "query",
+        adapter,
+        mark="starrocks",
+        gateway="manual_starrocks",
+        tmp_path=tmp_path,
+        is_remote=False,
+    )
+
+    ctx.init()
+    try:
+        with ctx.engine_adapter.session({}):
+            yield ctx
+    finally:
+        ctx.cleanup()
+
+
+@pytest.fixture
+def engine_adapter(ctx: TestContext) -> StarRocksEngineAdapter:
+    assert isinstance(ctx.engine_adapter, StarRocksEngineAdapter)
+    return ctx.engine_adapter
+
+
 @pytest.fixture(scope="module")
 def starrocks_adapter(starrocks_connection_config) -> StarRocksEngineAdapter:
-    """Create a real StarRocks adapter connected to database."""
+    """Create a real StarRocks adapter connected to database.
+    It's still used in a lot of tests, so it can't be removed yet.
+    """
     from pymysql import connect
 
     connection_factory = partial(connect, **starrocks_connection_config)
@@ -63,8 +116,6 @@ def starrocks_adapter(starrocks_connection_config) -> StarRocksEngineAdapter:
     # Cleanup: adapter will auto-close connection
 
 
-
-
 class TestBasicOperations:
     """
     Basic Operations
@@ -73,260 +124,232 @@ class TestBasicOperations:
     This allows running individual tests and clear failure reporting.
     """
 
-    def test_create_drop_schema(self, starrocks_adapter: StarRocksEngineAdapter):
-        """Test CREATE DATABASE and DROP DATABASE."""
-        db_name = "sr_test_create_drop_db"
+    def test_create_drop_schema(self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter):
+        """Test CREATE DATABASE and DROP DATABASE (TestContext version)."""
+        db_name = ctx.schema("sr_test_create_drop_db")
 
-        try:
-            # CREATE DATABASE
-            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
-            result = starrocks_adapter.fetchone(
-                f"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{db_name}'"
-            )
-            assert result is not None, "CREATE DATABASE failed"
-            assert result[0] == db_name
+        # CREATE DATABASE
+        engine_adapter.create_schema(db_name, ignore_if_exists=True)
+        result = engine_adapter.fetchone(
+            f"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{db_name}'"
+        )
+        assert result is not None, "CREATE DATABASE failed"
+        assert result[0] == db_name
 
-            # DROP DATABASE
-            starrocks_adapter.drop_schema(db_name)
-            result = starrocks_adapter.fetchone(
-                f"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{db_name}'"
-            )
-            assert result is None, "DROP DATABASE failed"
-        finally:
-            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+        # DROP DATABASE
+        engine_adapter.drop_schema(db_name)
+        result = engine_adapter.fetchone(
+            f"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{db_name}'"
+        )
+        assert result is None, "DROP DATABASE failed"
 
-    def test_create_drop_table(self, starrocks_adapter: StarRocksEngineAdapter):
-        """Test CREATE TABLE and DROP TABLE."""
-        db_name = "sr_test_table_db"
-        table_name = f"{db_name}.sr_test_table"
-
-        try:
-            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
-
-            # CREATE TABLE
-            starrocks_adapter.create_table(
-                table_name,
-                target_columns_to_types={
-                    "id": exp.DataType.build("INT"),
-                    "name": exp.DataType.build("VARCHAR(100)"),
-                },
-                table_properties={
-                    "properties": {
-                        "replication_num": exp.Literal.string("1"),
-                    },
-                },
-            )
-            result = starrocks_adapter.fetchone(
-                f"SELECT TABLE_NAME FROM information_schema.TABLES "
-                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'sr_test_table'"
-            )
-            assert result is not None, "CREATE TABLE failed"
-
-            # DROP TABLE
-            starrocks_adapter.drop_table(table_name)
-            result = starrocks_adapter.fetchone(
-                f"SELECT TABLE_NAME FROM information_schema.TABLES "
-                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'sr_test_table'"
-            )
-            assert result is None, "DROP TABLE failed"
-        finally:
-            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
-
-    def test_insert_select(self, starrocks_adapter: StarRocksEngineAdapter):
-        """Test INSERT and SELECT operations."""
-        db_name = "sr_test_insert_db"
-        table_name = f"{db_name}.sr_test_table"
-
-        try:
-            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
-            starrocks_adapter.create_table(
-                table_name,
-                target_columns_to_types={
-                    "id": exp.DataType.build("INT"),
-                    "name": exp.DataType.build("VARCHAR(100)"),
-                },
-            )
-
-            # INSERT
-            starrocks_adapter.execute(
-                f"INSERT INTO {table_name} (id, name) VALUES (1, 'Alice'), (2, 'Bob')"
-            )
-
-            # SELECT
-            results = starrocks_adapter.fetchall(
-                f"SELECT id, name FROM {table_name} ORDER BY id"
-            )
-            assert len(results) == 2, "INSERT/SELECT failed"
-            assert results[0] == (1, "Alice")
-            assert results[1] == (2, "Bob")
-        finally:
-            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
-
-    def test_update(self, starrocks_adapter: StarRocksEngineAdapter):
-        """Test UPDATE operation."""
-        db_name = "sr_test_update_db"
-        table_name = f"{db_name}.sr_test_table"
-
-        try:
-            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
-            starrocks_adapter.create_table(
-                table_name,
-                target_columns_to_types={
-                    "id": exp.DataType.build("INT"),
-                    "name": exp.DataType.build("VARCHAR(100)"),
-                },
-                table_properties={"primary_key": "id"},
-            )
-            starrocks_adapter.execute(
-                f"INSERT INTO {table_name} (id, name) VALUES (1, 'Alice')"
-            )
-
-            # UPDATE
-            starrocks_adapter.execute(
-                f"UPDATE {table_name} SET name = 'Alice Updated' WHERE id = 1"
-            )
-            result = starrocks_adapter.fetchone(
-                f"SELECT name FROM {table_name} WHERE id = 1"
-            )
-            assert result[0] == "Alice Updated", "UPDATE failed"
-        finally:
-            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
-
-    def test_delete(self, starrocks_adapter: StarRocksEngineAdapter):
-        """Test DELETE operation."""
-        db_name = "sr_test_delete_db"
-        table_name = f"{db_name}.sr_test_table"
-
-        try:
-            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
-            starrocks_adapter.create_table(
-                table_name,
-                target_columns_to_types={
-                    "id": exp.DataType.build("INT"),
-                    "name": exp.DataType.build("VARCHAR(100)"),
-                },
-            )
-            starrocks_adapter.execute(
-                f"INSERT INTO {table_name} (id, name) VALUES (1, 'Alice'), (2, 'Bob')"
-            )
-
-            # DELETE
-            starrocks_adapter.delete_from(exp.to_table(table_name), "id = 2")
-            count = starrocks_adapter.fetchone(f"SELECT COUNT(*) FROM {table_name}")
-            assert count[0] == 1, "DELETE failed"
-        finally:
-            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
-
-    def test_rename_table(self, starrocks_adapter: StarRocksEngineAdapter):
-        """Test RENAME TABLE operation."""
-        db_name = "sr_test_rename_db"
-        old_table = f"{db_name}.old_table"
-        new_table = f"{db_name}.new_table"
-
-        try:
-            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
-            starrocks_adapter.create_table(
-                old_table,
-                target_columns_to_types={
-                    "id": exp.DataType.build("INT"),
-                    "name": exp.DataType.build("VARCHAR(100)"),
-                },
-            )
-
-            # Insert test data
-            starrocks_adapter.execute(
-                f"INSERT INTO {old_table} (id, name) VALUES (1, 'Test')"
-            )
-
-            # RENAME TABLE
-            starrocks_adapter.rename_table(old_table, new_table)
-
-            # Verify old table doesn't exist
-            old_exists = starrocks_adapter.fetchone(
-                f"SELECT TABLE_NAME FROM information_schema.TABLES "
-                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'old_table'"
-            )
-            assert old_exists is None, "Old table should not exist after rename"
-
-            # Verify new table exists
-            new_exists = starrocks_adapter.fetchone(
-                f"SELECT TABLE_NAME FROM information_schema.TABLES "
-                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'new_table'"
-            )
-            assert new_exists is not None, "New table should exist after rename"
-
-            # Verify data is preserved
-            count = starrocks_adapter.fetchone(f"SELECT COUNT(*) FROM {new_table}")
-            assert count[0] == 1, "Data should be preserved after rename"
-        finally:
-            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
-
-    def test_create_index(self, starrocks_adapter: StarRocksEngineAdapter):
-        """Test CREATE INDEX operation (should be skipped for StarRocks).
-
-        StarRocks doesn't support standalone CREATE INDEX statements.
-        The adapter should skip index creation without errors.
+    def test_create_drop_table(self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter):
+        """Test CREATE TABLE and DROP TABLE (TestContext version).
         """
-        db_name = "sr_test_index_db"
-        table_name = f"{db_name}.sr_test_table"
+        table = ctx.table("sr_test_table")
 
-        try:
-            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
-            starrocks_adapter.create_table(
-                table_name,
-                target_columns_to_types={
-                    "id": exp.DataType.build("INT"),
-                    "name": exp.DataType.build("VARCHAR(100)"),
-                },
-            )
+        engine_adapter.create_table(
+            table,
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                "name": exp.DataType.build("VARCHAR(100)"),
+            },
+        )
 
-            # CREATE INDEX (should be skipped silently)
-            starrocks_adapter.create_index(table_name, "idx_name", ("name",))
+        db_name = table.db
+        table_name = table.name
+        exists = engine_adapter.fetchone(
+            f"SELECT TABLE_NAME FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{table_name}'"
+        )
+        assert exists is not None, "CREATE TABLE failed"
 
-            # Verify table still exists and is functional
-            count = starrocks_adapter.fetchone(f"SELECT COUNT(*) FROM {table_name}")
-            assert (
-                count is not None
-            ), "Table should still be functional after skipped index creation"
-        finally:
-            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+        engine_adapter.drop_table(table)
+        exists = engine_adapter.fetchone(
+            f"SELECT TABLE_NAME FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{table_name}'"
+        )
+        assert exists is None, "DROP TABLE failed"
 
-    def test_create_drop_view(self, starrocks_adapter: StarRocksEngineAdapter):
-        """Test CREATE VIEW and DROP VIEW."""
-        db_name = "sr_test_view_db"
-        table_name = f"{db_name}.sr_test_table"
-        view_name = f"{db_name}.sr_test_view"
+    def test_create_table_like_preserves_metadata_and_copies_no_data(
+        self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter
+    ) -> None:
+        """
+        Verify StarRocks native CREATE TABLE LIKE semantics:
+        - Copies schema (columns)
+        - Does NOT copy data
+        - Preserves key table metadata (at least PRIMARY KEY / DISTRIBUTED BY)
+        """
+        source = ctx.table("src_like")
+        target = ctx.table("tgt_like")
 
-        try:
-            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
-            starrocks_adapter.create_table(
-                table_name,
-                target_columns_to_types={
-                    "id": exp.DataType.build("INT"),
-                    "name": exp.DataType.build("VARCHAR(100)"),
-                },
-            )
+        engine_adapter.create_table(
+            source,
+            target_columns_to_types={
+                "id": exp.DataType.build("BIGINT"),
+                "name": exp.DataType.build("VARCHAR(100)"),
+            },
+            primary_key=("id",),
+            table_properties={
+                # Make metadata visible in SHOW CREATE TABLE so LIKE preservation is testable.
+                "distributed_by": "HASH(id) BUCKETS 10",
+                "replication_num": "1",
+            },
+        )
 
-            # CREATE VIEW
-            starrocks_adapter.create_view(
-                view_name,
-                parse_one(f"SELECT id, name FROM {table_name}"),
-            )
-            result = starrocks_adapter.fetchone(
-                f"SELECT TABLE_NAME FROM information_schema.VIEWS "
-                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'sr_test_view'"
-            )
-            assert result is not None, "CREATE VIEW failed"
+        engine_adapter.execute(
+            f"INSERT INTO {source.sql(dialect=ctx.dialect, identify=True)} (id, name) "
+            "VALUES (1, 'a'), (2, 'b')"
+        )
 
-            # DROP VIEW
-            starrocks_adapter.drop_view(view_name)
-            result = starrocks_adapter.fetchone(
-                f"SELECT TABLE_NAME FROM information_schema.VIEWS "
-                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'sr_test_view'"
-            )
-            assert result is None, "DROP VIEW failed"
-        finally:
-            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+        engine_adapter.create_table_like(target, source, exists=True)
+
+        # Like should not copy data.
+        src_count = engine_adapter.fetchone(
+            f"SELECT COUNT(*) FROM {source.sql(dialect=ctx.dialect, identify=True)}"
+        )[0]
+        tgt_count = engine_adapter.fetchone(
+            f"SELECT COUNT(*) FROM {target.sql(dialect=ctx.dialect, identify=True)}"
+        )[0]
+        assert src_count == 2
+        assert tgt_count == 0
+
+        # Like should preserve key metadata (engine-defined behavior).
+        ddl = engine_adapter.fetchone(
+            f"SHOW CREATE TABLE {target.sql(dialect=ctx.dialect, identify=True)}"
+        )[1]
+        ddl_upper = ddl.upper()
+        assert "PRIMARY KEY" in ddl_upper
+        assert "DISTRIBUTED BY" in ddl_upper
+
+    def test_create_table_like_exists_false_raises(
+        self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter
+    ) -> None:
+        """If exists=False and target already exists, StarRocks should error."""
+        source = ctx.table("src_like_exists")
+        target = ctx.table("tgt_like_exists")
+
+        engine_adapter.create_table(
+            source,
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+            },
+            primary_key=("id",),
+            table_properties={"replication_num": "1"},
+        )
+        engine_adapter.create_table_like(target, source, exists=True)
+
+        with pytest.raises(Exception):
+            engine_adapter.create_table_like(target, source, exists=False)
+
+
+    def test_delete(self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter):
+        """Test DELETE operation (TestContext version)."""
+        table = ctx.table("sr_test_table")
+        table_sql = table.sql(dialect=ctx.dialect, identify=True)
+
+        engine_adapter.create_table(
+            table,
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                "name": exp.DataType.build("VARCHAR(100)"),
+            },
+        )
+        engine_adapter.execute(
+            f"INSERT INTO {table_sql} (id, name) VALUES (1, 'Alice'), (2, 'Bob')"
+        )
+
+        engine_adapter.delete_from(table, "id = 2")
+        count = engine_adapter.fetchone(f"SELECT COUNT(*) FROM {table_sql}")
+        assert count[0] == 1, "DELETE failed"
+
+    def test_rename_table(self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter):
+        """Test RENAME TABLE operation (TestContext version)."""
+        old_table = ctx.table("old_table")
+        new_table = ctx.table("new_table")
+
+        old_table_sql = old_table.sql(dialect=ctx.dialect, identify=True)
+        new_table_sql = new_table.sql(dialect=ctx.dialect, identify=True)
+
+        engine_adapter.create_table(
+            old_table,
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                "name": exp.DataType.build("VARCHAR(100)"),
+            },
+        )
+
+        engine_adapter.execute(f"INSERT INTO {old_table_sql} (id, name) VALUES (1, 'Test')")
+        engine_adapter.rename_table(old_table, new_table)
+
+        db_name = old_table.db
+        old_table_name = old_table.name
+        new_table_name = new_table.name
+
+        old_exists = engine_adapter.fetchone(
+            f"SELECT TABLE_NAME FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{old_table_name}'"
+        )
+        assert old_exists is None, "Old table should not exist after rename"
+
+        new_exists = engine_adapter.fetchone(
+            f"SELECT TABLE_NAME FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{new_table_name}'"
+        )
+        assert new_exists is not None, "New table should exist after rename"
+
+        count = engine_adapter.fetchone(f"SELECT COUNT(*) FROM {new_table_sql}")
+        assert count[0] == 1, "Data should be preserved after rename"
+
+    def test_create_index(self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter):
+        """Test CREATE INDEX operation (skipped for StarRocks) (TestContext version)."""
+        table = ctx.table("sr_test_table")
+        table_sql = table.sql(dialect=ctx.dialect, identify=True)
+
+        engine_adapter.create_table(
+            table,
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                "name": exp.DataType.build("VARCHAR(100)"),
+            },
+        )
+
+        # CREATE INDEX (should be skipped silently)
+        engine_adapter.create_index(table, "idx_name", ("name",))
+
+        count = engine_adapter.fetchone(f"SELECT COUNT(*) FROM {table_sql}")
+        assert count is not None, "Table should still be functional after skipped index creation"
+
+    def test_create_drop_view(self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter):
+        """Test CREATE VIEW and DROP VIEW (TestContext version)."""
+        table = ctx.table("sr_test_table")
+        view = ctx.table("sr_test_view")
+
+        engine_adapter.create_table(
+            table,
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                "name": exp.DataType.build("VARCHAR(100)"),
+            },
+        )
+
+        query = exp.select(exp.column("id"), exp.column("name")).from_(table)
+        engine_adapter.create_view(view, query)
+
+        db_name = view.db
+        view_name = view.name
+        result = engine_adapter.fetchone(
+            f"SELECT TABLE_NAME FROM information_schema.VIEWS "
+            f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{view_name}'"
+        )
+        assert result is not None, "CREATE VIEW failed"
+
+        engine_adapter.drop_view(view)
+        result = engine_adapter.fetchone(
+            f"SELECT TABLE_NAME FROM information_schema.VIEWS "
+            f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{view_name}'"
+        )
+        assert result is None, "DROP VIEW failed"
 
 
 class TestTableFeatures:
@@ -337,121 +360,112 @@ class TestTableFeatures:
     Focus on independent functionality like comments and data type compatibility.
     """
 
-    def test_table_and_column_comments(self, starrocks_adapter: StarRocksEngineAdapter):
+    def test_table_and_column_comments(self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter):
         """Test table and column comments."""
-        db_name = "sr_test_comment_db"
-        table_name = f"{db_name}.sr_comment_table"
+        table = ctx.table("sr_comment_table")
+        db_name = table.db
+        table_name = table.name
 
-        try:
-            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+        # CREATE TABLE with comments
+        engine_adapter.create_table(
+            table,
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                "name": exp.DataType.build("VARCHAR(100)"),
+            },
+            table_description="Test table comment",
+            column_descriptions={
+                "id": "User ID",
+                "name": "User name",
+            },
+        )
 
-            # CREATE TABLE with comments
-            starrocks_adapter.create_table(
-                table_name,
-                target_columns_to_types={
-                    "id": exp.DataType.build("INT"),
-                    "name": exp.DataType.build("VARCHAR(100)"),
-                },
-                table_description="Test table comment",
-                column_descriptions={
-                    "id": "User ID",
-                    "name": "User name",
-                },
-            )
+        # Verify table comment
+        result = engine_adapter.fetchone(
+            f"SELECT TABLE_COMMENT FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{table_name}'"
+        )
+        assert result[0] == "Test table comment", "Table comment not set"
 
-            # Verify table comment
-            result = starrocks_adapter.fetchone(
-                f"SELECT TABLE_COMMENT FROM information_schema.TABLES "
-                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'sr_comment_table'"
-            )
-            assert result[0] == "Test table comment", "Table comment not set"
+        # Verify column comments
+        columns = engine_adapter.fetchall(
+            f"SELECT COLUMN_NAME, COLUMN_COMMENT FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{table_name}' "
+            f"ORDER BY ORDINAL_POSITION"
+        )
+        column_comments = {row[0]: row[1] for row in columns}
+        assert column_comments["id"] == "User ID"
+        assert column_comments["name"] == "User name"
 
-            # Verify column comments
-            columns = starrocks_adapter.fetchall(
-                f"SELECT COLUMN_NAME, COLUMN_COMMENT FROM information_schema.COLUMNS "
-                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'sr_comment_table' "
-                f"ORDER BY ORDINAL_POSITION"
-            )
-            column_comments = {row[0]: row[1] for row in columns}
-            assert column_comments["id"] == "User ID"
-            assert column_comments["name"] == "User name"
-        finally:
-            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
-
-    def test_multiple_data_types(self, starrocks_adapter: StarRocksEngineAdapter):
+    def test_multiple_data_types(self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter):
         """
         Test basic data types support.
 
         Covers: numeric, string, datetime, boolean, and JSON types with precision.
         Reference: https://docs.starrocks.io/docs/sql-reference/data-types/
         """
-        db_name = "sr_test_types_db"
-        table_name = f"{db_name}.sr_types_table"
+        table = ctx.table("sr_types_table")
+        db_name = table.db
+        table_name = table.name
+        table_sql = table.sql(dialect=ctx.dialect, identify=True)
 
-        try:
-            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+        # CREATE TABLE with multiple data types
+        engine_adapter.create_table(
+            table,
+            target_columns_to_types={
+                # Numeric types
+                "col_tinyint": exp.DataType.build("TINYINT"),
+                "col_smallint": exp.DataType.build("SMALLINT"),
+                "col_int": exp.DataType.build("INT"),
+                "col_bigint": exp.DataType.build("BIGINT"),
+                "col_float": exp.DataType.build("FLOAT"),
+                "col_double": exp.DataType.build("DOUBLE"),
+                "col_decimal": exp.DataType.build("DECIMAL(18,2)"),
+                # String types with precision
+                "col_char": exp.DataType.build("CHAR(10)"),
+                "col_varchar": exp.DataType.build("VARCHAR(200)"),
+                "col_string": exp.DataType.build("STRING"),
+                # Date/Time types
+                "col_date": exp.DataType.build("DATE"),
+                "col_datetime": exp.DataType.build("DATETIME"),
+                # Boolean and JSON
+                "col_boolean": exp.DataType.build("BOOLEAN"),
+                "col_json": exp.DataType.build("JSON"),
+            },
+        )
 
-            # CREATE TABLE with multiple data types
-            starrocks_adapter.create_table(
-                table_name,
-                target_columns_to_types={
-                    # Numeric types
-                    "col_tinyint": exp.DataType.build("TINYINT"),
-                    "col_smallint": exp.DataType.build("SMALLINT"),
-                    "col_int": exp.DataType.build("INT"),
-                    "col_bigint": exp.DataType.build("BIGINT"),
-                    "col_float": exp.DataType.build("FLOAT"),
-                    "col_double": exp.DataType.build("DOUBLE"),
-                    "col_decimal": exp.DataType.build("DECIMAL(18,2)"),
-                    # String types with precision
-                    "col_char": exp.DataType.build("CHAR(10)"),
-                    "col_varchar": exp.DataType.build("VARCHAR(200)"),
-                    "col_string": exp.DataType.build("STRING"),
-                    # Date/Time types
-                    "col_date": exp.DataType.build("DATE"),
-                    "col_datetime": exp.DataType.build("DATETIME"),
-                    # Boolean and JSON
-                    "col_boolean": exp.DataType.build("BOOLEAN"),
-                    "col_json": exp.DataType.build("JSON"),
-                },
-            )
+        # Verify all columns created with correct types
+        columns = engine_adapter.fetchall(
+            f"SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{table_name}' "
+            f"ORDER BY ORDINAL_POSITION"
+        )
+        assert len(columns) == 14, f"Expected 14 columns, got {len(columns)}"
 
-            # Verify all columns created with correct types
-            columns = starrocks_adapter.fetchall(
-                f"SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS "
-                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'sr_types_table' "
-                f"ORDER BY ORDINAL_POSITION"
-            )
-            assert len(columns) == 14, f"Expected 14 columns, got {len(columns)}"
+        # Test data insertion with various types
+        engine_adapter.execute(
+            f"""
+            INSERT INTO {table_sql}
+            (col_tinyint, col_smallint, col_int, col_bigint, col_float, col_double, col_decimal,
+             col_char, col_varchar, col_string, col_date, col_datetime, col_boolean, col_json)
+            VALUES
+            (127, 32767, 2147483647, 9223372036854775807, 3.14, 3.141592653589793, 12345.67,
+             'test', 'test varchar', 'test string', '2024-01-01', '2024-01-01 12:00:00',
+             true, '{{"key": "value"}}')
+            """
+        )
 
-            # Test data insertion with various types
-            starrocks_adapter.execute(
-                f"""
-                INSERT INTO {table_name}
-                (col_tinyint, col_smallint, col_int, col_bigint, col_float, col_double, col_decimal,
-                 col_char, col_varchar, col_string, col_date, col_datetime, col_boolean, col_json)
-                VALUES
-                (127, 32767, 2147483647, 9223372036854775807, 3.14, 3.141592653589793, 12345.67,
-                 'test', 'test varchar', 'test string', '2024-01-01', '2024-01-01 12:00:00',
-                 true, '{{"key": "value"}}')
-                """
-            )
+        # Verify insertion
+        count = engine_adapter.fetchone(f"SELECT COUNT(*) FROM {table_sql}")
+        assert count[0] == 1, "Data insertion with basic types failed"
 
-            # Verify insertion
-            count = starrocks_adapter.fetchone(f"SELECT COUNT(*) FROM {table_name}")
-            assert count[0] == 1, "Data insertion with basic types failed"
-
-            # Verify data retrieval
-            result = starrocks_adapter.fetchone(
-                f"SELECT col_int, col_varchar, col_date FROM {table_name}"
-            )
-            assert result[0] == 2147483647
-            assert result[1] == "test varchar"
-        finally:
-            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+        # Verify data retrieval
+        result = engine_adapter.fetchone(f"SELECT col_int, col_varchar, col_date FROM {table_sql}")
+        assert result[0] == 2147483647
+        assert result[1] == "test varchar"
 
     # @pytest.mark.skip(reason="Complex types (ARRAY/MAP/STRUCT) may not be fully supported yet")
-    def test_complex_data_types(self, starrocks_adapter: StarRocksEngineAdapter):
+    def test_complex_data_types(self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter):
         """
         Test complex and nested data types support (ARRAY, MAP, STRUCT).
 
@@ -467,81 +481,75 @@ class TestTableFeatures:
         configuration or may not be fully supported in the current adapter.
         Reference: https://docs.starrocks.io/docs/sql-reference/data-types/
         """
-        db_name = "sr_test_complex_types_db"
-        table_name = f"{db_name}.sr_complex_types_table"
+        table = ctx.table("sr_complex_types_table")
+        db_name = table.db
+        table_name = table.name
+        table_sql = table.sql(dialect=ctx.dialect, identify=True)
 
-        try:
-            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+        # CREATE TABLE with complex and nested data types
+        engine_adapter.create_table(
+            table,
+            target_columns_to_types={
+                "id": exp.DataType.build("BIGINT"),
+                # Simple complex types
+                "col_array_simple": exp.DataType.build("ARRAY<INT>"),
+                "col_map_simple": exp.DataType.build("MAP<STRING,INT>"),
+                "col_struct_simple": exp.DataType.build("STRUCT<a INT, b STRING>"),
+                # Nested ARRAY
+                "col_array_nested": exp.DataType.build("ARRAY<ARRAY<INT>>"),
+                # Nested MAP (value is ARRAY)
+                "col_map_nested": exp.DataType.build("MAP<STRING,ARRAY<INT>>"),
+                # Nested STRUCT (contains ARRAY and MAP)
+                "col_struct_nested": exp.DataType.build(
+                    "STRUCT<id INT, tags ARRAY<STRING>, metadata MAP<STRING,INT>>"
+                ),
+                # ARRAY of STRUCT
+                "col_array_of_struct": exp.DataType.build("ARRAY<STRUCT<id INT, name STRING>>"),
+                # Deep nesting: MAP with ARRAY of STRUCT
+                "col_deep_nested": exp.DataType.build(
+                    "MAP<STRING,ARRAY<STRUCT<field1 INT, field2 STRING>>>"
+                ),
+            },
+        )
 
-            # CREATE TABLE with complex and nested data types
-            starrocks_adapter.create_table(
-                table_name,
-                target_columns_to_types={
-                    "id": exp.DataType.build("BIGINT"),
-                    # Simple complex types
-                    "col_array_simple": exp.DataType.build("ARRAY<INT>"),
-                    "col_map_simple": exp.DataType.build("MAP<STRING,INT>"),
-                    "col_struct_simple": exp.DataType.build("STRUCT<a INT, b STRING>"),
-                    # Nested ARRAY
-                    "col_array_nested": exp.DataType.build("ARRAY<ARRAY<INT>>"),
-                    # Nested MAP (value is ARRAY)
-                    "col_map_nested": exp.DataType.build("MAP<STRING,ARRAY<INT>>"),
-                    # Nested STRUCT (contains ARRAY and MAP)
-                    "col_struct_nested": exp.DataType.build(
-                        "STRUCT<id INT, tags ARRAY<STRING>, metadata MAP<STRING,INT>>"
-                    ),
-                    # ARRAY of STRUCT
-                    "col_array_of_struct": exp.DataType.build(
-                        "ARRAY<STRUCT<id INT, name STRING>>"
-                    ),
-                    # Deep nesting: MAP with ARRAY of STRUCT
-                    "col_deep_nested": exp.DataType.build(
-                        "MAP<STRING,ARRAY<STRUCT<field1 INT, field2 STRING>>>"
-                    ),
-                },
+        # Verify all columns created
+        columns = engine_adapter.fetchall(
+            f"SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{table_name}' "
+            f"ORDER BY ORDINAL_POSITION"
+        )
+        assert len(columns) == 9, f"Expected 9 columns, got {len(columns)}"
+
+        # Test data insertion with nested types
+        engine_adapter.execute(
+            f"""
+            INSERT INTO {table_sql}
+            (id, col_array_simple, col_map_simple, col_struct_simple,
+             col_array_nested, col_map_nested, col_struct_nested,
+             col_array_of_struct, col_deep_nested)
+            VALUES (
+                1,
+                [1,2,3],
+                map{{'key1':10,'key2':20}},
+                row(100,'simple'),
+                [[1,2],[3,4]],
+                map{{'arr1':[1,2],'arr2':[3,4]}},
+                row(1001, ['tag1','tag2'], map{{'meta1':1,'meta2':2}}),
+                [row(1,'Alice'), row(2,'Bob')],
+                map{{'group1':[row(10,'field_a'), row(20,'field_b')]}}
             )
+            """
+        )
 
-            # Verify all columns created
-            columns = starrocks_adapter.fetchall(
-                f"SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS "
-                f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = 'sr_complex_types_table' "
-                f"ORDER BY ORDINAL_POSITION"
-            )
-            assert len(columns) == 9, f"Expected 9 columns, got {len(columns)}"
+        # Verify insertion
+        count = engine_adapter.fetchone(f"SELECT COUNT(*) FROM {table_sql}")
+        assert count[0] == 1, "Data insertion with complex nested types failed"
 
-            # Test data insertion with nested types
-            # Note: Syntax may vary depending on StarRocks version
-            starrocks_adapter.execute(
-                f"""
-                INSERT INTO {table_name}
-                (id, col_array_simple, col_map_simple, col_struct_simple,
-                 col_array_nested, col_map_nested, col_struct_nested,
-                 col_array_of_struct, col_deep_nested)
-                VALUES (
-                    1,
-                    [1,2,3],
-                    map{{'key1':10,'key2':20}},
-                    row(100,'simple'),
-                    [[1,2],[3,4]],
-                    map{{'arr1':[1,2],'arr2':[3,4]}},
-                    row(1001, ['tag1','tag2'], map{{'meta1':1,'meta2':2}}),
-                    [row(1,'Alice'), row(2,'Bob')],
-                    map{{'group1':[row(10,'field_a'), row(20,'field_b')]}}
-                )
-                """
-            )
-
-            # Verify insertion
-            count = starrocks_adapter.fetchone(f"SELECT COUNT(*) FROM {table_name}")
-            assert count[0] == 1, "Data insertion with complex nested types failed"
-
-            # Verify data retrieval for simple types
-            result = starrocks_adapter.fetchone(
-                f"SELECT col_array_simple, col_struct_simple FROM {table_name}"
-            )
-            assert result is not None, "Failed to retrieve complex type data"
-        finally:
-            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+        # Verify data retrieval for simple types
+        result = engine_adapter.fetchone(
+            f"SELECT col_array_simple, col_struct_simple FROM {table_sql}"
+        )
+        assert result is not None, "Failed to retrieve complex type data"
 
 
 class TestEndToEndModelParsing:
@@ -1528,6 +1536,57 @@ class TestStarRocksAbility:
 
         finally:
             starrocks_adapter.execute(f"DROP {sql_keyword} IF EXISTS {test_name}")
+
+    # ==================== DML Capabilities ====================
+
+    def test_insert_select_supported(self, starrocks_adapter: StarRocksEngineAdapter):
+        """Basic INSERT/SELECT support (raw SQL capability check)."""
+        db_name = "sr_ability_insert_select"
+        table_name = f"{db_name}.t"
+
+        try:
+            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+            starrocks_adapter.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id INT,
+                    name VARCHAR(100)
+                ) PRIMARY KEY (id)
+                DISTRIBUTED BY HASH(id) BUCKETS 10
+                """
+            )
+            starrocks_adapter.execute(
+                f"INSERT INTO {table_name} (id, name) VALUES (1, 'Alice'), (2, 'Bob')"
+            )
+            rows = starrocks_adapter.fetchall(f"SELECT id, name FROM {table_name} ORDER BY id")
+            assert list(rows) == [(1, "Alice"), (2, "Bob")], f"Data mismatch: {rows}"
+        finally:
+            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
+
+    def test_update_supported(self, starrocks_adapter: StarRocksEngineAdapter):
+        """Basic UPDATE support (raw SQL capability check)."""
+        db_name = "sr_ability_update"
+        table_name = f"{db_name}.t"
+
+        try:
+            starrocks_adapter.create_schema(db_name, ignore_if_exists=True)
+            starrocks_adapter.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id INT,
+                    name VARCHAR(100)
+                ) PRIMARY KEY (id)
+                DISTRIBUTED BY HASH(id) BUCKETS 10
+                """
+            )
+            starrocks_adapter.execute(f"INSERT INTO {table_name} (id, name) VALUES (1, 'Alice')")
+            starrocks_adapter.execute(
+                f"UPDATE {table_name} SET name = 'Alice Updated' WHERE id = 1"
+            )
+            result = starrocks_adapter.fetchone(f"SELECT name FROM {table_name} WHERE id = 1")
+            assert result == ("Alice Updated",), f"UPDATE failed: {result}"
+        finally:
+            starrocks_adapter.drop_schema(db_name, ignore_if_not_exists=True)
 
     # ==================== DELETE Operations - Success Cases ====================
 

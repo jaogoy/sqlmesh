@@ -22,12 +22,12 @@ import typing as t
 import pytest
 from sqlglot import expressions as exp
 from sqlglot import parse_one
+from pytest_mock.plugin import MockerFixture
 
 from tests.core.engine_adapter import to_sql_calls
 from sqlmesh.core.engine_adapter.starrocks import StarRocksEngineAdapter
 from sqlmesh.core.dialect import parse
 from sqlmesh.core.model import load_sql_based_model, SqlModel
-from pytest_mock.plugin import MockerFixture
 
 pytestmark = [pytest.mark.starrocks, pytest.mark.engine]
 
@@ -110,21 +110,59 @@ class TestTableOperations:
     ):
         """Test CREATE TABLE LIKE statement."""
         adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        adapter.create_table_like("target_table", "source_table")
+        assert to_sql_calls(adapter) == [
+            "CREATE TABLE IF NOT EXISTS `target_table` LIKE `source_table`",
+        ]
 
-        # Mock the columns() method to avoid database dependency
-        from unittest.mock import MagicMock
+    def test_create_table_like_exists_false(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Test CREATE TABLE LIKE with exists=False (no IF NOT EXISTS)."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        adapter.create_table_like("target_table", "source_table", exists=False)
+        assert to_sql_calls(adapter) == [
+            "CREATE TABLE `target_table` LIKE `source_table`",
+        ]
 
-        adapter.columns = MagicMock(return_value={"a": exp.DataType.build("INT")})
+    def test_create_table_like_qualified_names(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Test CREATE TABLE LIKE with database-qualified names."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        adapter.create_table_like("db.target_table", "db.source_table")
+        assert to_sql_calls(adapter) == [
+            "CREATE TABLE IF NOT EXISTS `db`.`target_table` LIKE `db`.`source_table`",
+        ]
+
+    def test_create_table_like_does_not_call_columns(
+        self,
+        make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter],
+        mocker: MockerFixture,
+    ):
+        """
+        StarRocks overrides _create_table_like to use native CREATE TABLE LIKE and should
+        not fall back to the base implementation (which calls columns(source)).
+        """
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        columns_mock = mocker.patch.object(
+            adapter, "columns", side_effect=AssertionError("columns() should not be called")
+        )
 
         adapter.create_table_like("target_table", "source_table")
+        assert columns_mock.call_count == 0
 
-        # Verify columns() was called to get source table structure
-        adapter.columns.assert_called_once_with("source_table")
+    def test_create_table_like_clears_cache(
+        self,
+        make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter],
+        mocker: MockerFixture,
+    ):
+        """create_table_like should clear the data object cache for the target table."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        clear_cache = mocker.patch.object(adapter, "_clear_data_object_cache")
 
-        # Verify create_table was called with the columns from source table
-        sql = to_sql_calls(adapter)[0]
-        assert "CREATE TABLE IF NOT EXISTS `target_table`" in sql
-        assert "`a` INT" in sql
+        adapter.create_table_like("target_table", "source_table")
+        clear_cache.assert_called_once_with("target_table")
 
     def test_rename_table(
         self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]

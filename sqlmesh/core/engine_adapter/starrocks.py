@@ -1860,6 +1860,34 @@ class StarRocksEngineAdapter(
         )
         return
 
+    def _create_table_like(
+        self,
+        target_table_name: TableName,
+        source_table_name: TableName,
+        exists: bool,
+        **kwargs: t.Any,
+    ) -> None:
+        """Create a new table using StarRocks' native `CREATE TABLE ... LIKE ...` syntax.
+
+        The base implementation re-creates the target table from `columns(source)` which can
+        lose non-column metadata. Using LIKE lets the engine preserve more of the original
+        table definition (engine-defined behavior).
+        """
+        self.execute(
+            exp.Create(
+                this=exp.to_table(target_table_name),
+                kind="TABLE",
+                exists=exists,
+                properties=exp.Properties(
+                    expressions=[
+                        exp.LikeProperty(
+                            this=exp.to_table(source_table_name),
+                        ),
+                    ],
+                ),
+            )
+        )
+
     def delete_from(
         self,
         table_name: TableName,
