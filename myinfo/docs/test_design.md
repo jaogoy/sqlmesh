@@ -1,8 +1,14 @@
-# StarRocks Table Properties Test Design
+# StarRocks Properties Test Design (Table / View / Materialized View)
 
 ## Overview
 
-This document defines the testing strategy for StarRocks table properties, covering both **integration tests** (end-to-end with real DB) and **unit tests** (function-level with parsed expressions).
+This document defines the testing strategy for StarRocks properties used in DDL generation, covering:
+
+- Table physical properties (e.g., keys, partition, distribution)
+- View properties (e.g., `SECURITY`)
+- Materialized view (MV) properties (e.g., `REFRESH` clause)
+
+It covers both **integration tests** (end-to-end with real DB) and **unit tests** (function-level with parsed expressions).
 
 ## Testing Strategy: Two-Tier Approach
 
@@ -142,6 +148,112 @@ This document defines the testing strategy for StarRocks table properties, cover
 
 ---
 
+### 7. View Properties (`security`)
+
+StarRocks view syntax supports `SECURITY <value>` (no `=`).
+
+| Value Form | Example | Location | Integration | Unit |
+|------------|---------|----------|-------------|------|
+| Identifier (unquoted) | `INVOKER` | view_properties | ✅ | ✅ |
+| String literal | `'INVOKER'` | view_properties | | ✅ |
+| Case-insensitive input | `invoker` | view_properties | | ✅ |
+| NONE | `NONE` | view_properties | ✅ | ✅ |
+| DEFINER (version-dependent) | `DEFINER` | view_properties | | ✅ |
+| Invalid enum | `'FOO'` | view_properties | | ✅ (error) |
+
+**Key Points**:
+
+- Adapter responsibility: accept supported forms, normalize to the expected enum, and render **`SECURITY <value>`** in `CREATE VIEW`.
+- Integration tests should validate **StarRocks accepts the generated DDL** and `SHOW CREATE VIEW` contains the expected clause.
+- If `DEFINER` is not supported by the target StarRocks version, keep it as **unit-only** or gate the integration assertion by version/capability.
+
+---
+
+### 8. MV Refresh Properties (`refresh_moment`, `refresh_scheme`)
+
+StarRocks MV syntax supports a `REFRESH ...` clause. In the adapter:
+
+- `refresh_moment` maps to the optional moment token: `IMMEDIATE | DEFERRED`
+- `refresh_scheme` is a string that begins with `MANUAL | ASYNC` and may include:
+  - `START ('...')`
+  - `EVERY (INTERVAL <n> <unit>)`
+
+Because the `refresh_scheme` text contains multiple optional parts, tests should cover parsing/normalization and final DDL rendering for representative forms.
+
+#### 8.1 `refresh_moment`
+
+| Value Form | Example | Location | Integration | Unit |
+|------------|---------|----------|-------------|------|
+| Identifier | `IMMEDIATE` | view_properties (MV) | ✅ | ✅ |
+| String literal | `'DEFERRED'` | view_properties (MV) | | ✅ |
+| Case-insensitive input | `deferred` | view_properties (MV) | | ✅ |
+| Invalid enum | `'AUTO'` | view_properties (MV) | | ✅ (error) |
+
+#### 8.2 `refresh_scheme`
+
+| Value Form | Example | Location | Integration | Unit |
+|------------|---------|----------|-------------|------|
+| ASYNC only | `'ASYNC'` | view_properties (MV) | ✅ | ✅ |
+| ASYNC + START (quote form) | `"ASYNC START ('2025-01-01 00:00:00')"` | view_properties (MV) | ✅ | ✅ |
+| ASYNC + EVERY | `'ASYNC EVERY (INTERVAL 5 MINUTE)'` | view_properties (MV) | ✅ | ✅ |
+| ASYNC + START + EVERY | `'ASYNC START ("2025-01-01 00:00:00") EVERY (INTERVAL 5 MINUTE)'` | view_properties (MV) | ✅ | ✅ |
+| Case-insensitive keywords | `'async start (2025-01-01) every (interval 5 minute)'` | view_properties (MV) | | ✅ |
+| Invalid prefix | `'SCHEDULE ...'` | view_properties (MV) | | ✅ (error) |
+| Malformed EVERY | `'ASYNC EVERY (INTERVAL X MINUTE)'` | view_properties (MV) | | ✅ (error) |
+| MANUAL only | `'MANUAL'` | view_properties (MV) | ✅ | ✅ |
+
+**Key Points**:
+
+- Adapter responsibility: validate/normalize and generate **syntactically correct** `REFRESH ...` DDL.
+- Integration tests should verify `CREATE MATERIALIZED VIEW` succeeds and `SHOW CREATE MATERIALIZED VIEW` contains the expected `REFRESH` clause.
+- The adapter intentionally does **not** validate whether StarRocks will *semantically* refresh data as expected; that is engine behavior.
+
+---
+
+### 9. Invalid / Error Case Coverage (Guideline)
+
+In addition to happy-path value-form coverage, add **targeted invalid tests** for properties where the adapter performs validation or parsing. Prefer unit tests for error cases, and keep integration tests focused on representative valid combinations.
+
+Recommended invalid categories (pick the most relevant per property):
+
+- **Invalid enum/token**: e.g., unknown `security` or `refresh_moment`
+- **Malformed structured string**: e.g., `refresh_scheme` missing required prefix or has malformed `EVERY (INTERVAL ...)`
+- **Wrong type form**: e.g., list/tuple where only a scalar is supported
+- **Mutual exclusivity / alias conflicts**: where the property system defines aliases or exclusive groups
+
+#### 9.1 Table Properties: Recommended Invalid Cases (Unit)
+
+Only add invalid tests where SQLMesh / adapter layer has explicit rules, parsing, or conflict checks (avoid testing StarRocks engine semantics).
+
+- **Key types (mutual exclusivity)**:
+  - Defining 2+ of `primary_key` / `duplicate_key` / `unique_key` / `aggregate_key` at the same time should fail.
+- **Aliases (mutual exclusivity)**:
+  - Defining both `partitioned_by` and `partition_by` should fail.
+  - Defining both `clustered_by` and `order_by` should fail.
+- **Common mis-typed property names (invalid name detection)**:
+  - `partition` (should be `partitioned_by` / `partition_by`)
+  - `distribution` / `distribute` (should be `distributed_by`)
+  - `order` / `ordering` (should be `order_by` / `clustered_by`)
+- **Partition definitions (`partitions`)**:
+  - Reject a single string containing multiple `PARTITION ...` definitions (must be tuple-of-strings).
+  - If partition kind is expression-based (not RANGE/LIST), reject providing `partitions` (if the adapter enforces this).
+- **Distribution parsing (`distributed_by`)**:
+  - `BUCKETS` with non-numeric value (e.g., `BUCKETS X`) should fail.
+  - Malformed strings that cannot be parsed as `HASH(...)` / `RANDOM` should fail.
+- **Order by limitations (`order_by` / `clustered_by`)**:
+  - If `ASC/DESC` is provided and the adapter disallows it, the adapter should fail fast with a clear error.
+
+#### 9.2 View / MV: Recommended Invalid Cases (Unit)
+
+- **View security (`security`)**:
+  - Unknown enum (e.g., `FOO`) should fail.
+- **MV refresh (`refresh_moment`, `refresh_scheme`)**:
+  - Unknown enum for `refresh_moment` should fail.
+  - `refresh_scheme` must start with `MANUAL` or `ASYNC` (otherwise fail).
+  - Malformed `EVERY (INTERVAL ...)` (non-numeric interval, missing unit) should fail.
+
+---
+
 ## Integration Test Cases (Representative Complex Scenarios)
 
 Based on the matrix above, select **representative complex scenarios** for integration tests:
@@ -254,6 +366,49 @@ physical_properties (
 )
 ```
 
+### Test Case 8: CREATE VIEW with SECURITY
+
+**Covers**: `security` value normalization + correct `SECURITY <value>` clause rendering
+
+- Create a base table
+- Create a view with `security = INVOKER` (or `NONE`)
+- Verify `SHOW CREATE VIEW` contains `SECURITY INVOKER` and the view is queryable
+
+### Test Case 9: CREATE MATERIALIZED VIEW with REFRESH (moment + scheme)
+
+**Covers**: `refresh_moment` + `refresh_scheme` parsing and rendering
+
+- Create a base table
+- Create an MV with `refresh_moment = IMMEDIATE` and `refresh_scheme = ASYNC START (...) EVERY (INTERVAL ... ...)`
+- Verify `SHOW CREATE MATERIALIZED VIEW` contains `REFRESH IMMEDIATE ASYNC ... START ... EVERY ...`
+
+### Test Case 10: CREATE MATERIALIZED VIEW with REFRESH (scheme only)
+
+**Covers**: scheme-only rendering (no moment token)
+
+- Create an MV with `refresh_scheme = MANUAL` (no `refresh_moment`)
+- Verify `SHOW CREATE MATERIALIZED VIEW` contains `REFRESH MANUAL` (or the StarRocks-equivalent rendering)
+
+### Test Case 11: CREATE MATERIALIZED VIEW (Combo A: Model Parameters + Properties Blocks)
+
+**Covers**: MV end-to-end DDL with a representative combination of:
+
+- Create a base table
+- Configure MV partition/clustering via **model parameters** (where SQLMesh model syntax supports this for MV kind)
+- Configure MV distribution / properties / refresh via **properties blocks** (e.g., physical/view properties)
+- Include table + column comments
+- Verify `SHOW CREATE MATERIALIZED VIEW` contains expected partition / order / distributed / properties / comment / refresh clauses and the MV is queryable
+
+### Test Case 12: CREATE MATERIALIZED VIEW (Combo B: All-in-Properties Form)
+
+**Covers**: MV end-to-end DDL where most configuration is supplied through properties blocks (minimal model parameters).
+
+- Create a base table
+- Create an MV with partition/clustering configured via MV properties block (rather than model parameters)
+- Configure distribution / other properties / refresh via MV properties
+- Include table + column comments
+- Verify `SHOW CREATE MATERIALIZED VIEW` contains expected clauses and the MV is queryable
+
 ---
 
 ## Test Implementation Approach
@@ -276,7 +431,7 @@ physical_properties (
 
 > Test classes are organized in order: **Table Key → Partition → Distribution → Order By → Comment → Properties**
 
-```
+```text
 tests/core/engine_adapter/
 ├── test_starrocks.py                    # Unit tests (parametrized, complete coverage)
 │   ├── TestSchemaOperations              # Existing: Schema/DB operations
@@ -285,6 +440,8 @@ tests/core/engine_adapter/
 │   ├── TestPartitionPropertyBuilding     # Partition (partitioned_by, partitions)
 │   ├── TestDistributionPropertyBuilding  # Distribution (distributed_by)
 │   ├── TestOrderByPropertyBuilding       # Order By (order_by, clustered_by)
+│   ├── TestViewPropertyBuilding          # View properties (security)
+│   ├── TestMVRefreshPropertyBuilding     # MV refresh (refresh_moment, refresh_scheme)
 │   └── TestGenericPropertyBuilding       # Generic properties (replication_num, etc.)
 │
 └── integration/
@@ -297,6 +454,8 @@ tests/core/engine_adapter/
             ├── test_e2e_partition_list          # Partition LIST
             ├── test_e2e_distribution_structured # Distribution structured forms
             ├── test_e2e_order_by                # Order By / Clustered By
+            ├── test_e2e_view_security            # View SECURITY
+            ├── test_e2e_mv_refresh               # MV REFRESH
             └── test_e2e_comprehensive           # All properties combined
 ```
 
@@ -328,4 +487,6 @@ For each integration test, verify:
 | clustered_by | 1 case | 2 cases |
 | comment | 1 case | 2 cases |
 | generic props | 1 case | 4 cases |
-| **Total** | **~19 integration tests** | **~41 unit tests** |
+| security (view) | 1 case | 6-7 cases |
+| refresh (MV) | 2 cases | 8-10 cases |
+| **Total** | **~23-24 integration tests** | **~55-60 unit tests** |

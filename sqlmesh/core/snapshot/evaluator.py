@@ -2042,6 +2042,40 @@ def _add_unique_key_to_physical_properties_for_doris(
     return physical_properties
 
 
+def _ensure_primary_key_for_starrocks_when_incremental_by_unique_key(
+    model: Model, physical_properties: t.Optional[t.Dict[str, t.Any]]
+) -> t.Dict[str, t.Any]:
+    """
+    Promote StarRocks incremental-by-unique-key models to PRIMARY KEY tables so that
+    complex DELETE/MERGE statements remain supported.
+    """
+
+    if (
+        model.dialect != "starrocks"
+        or not model.kind.is_incremental_by_unique_key
+        or "primary_key" in physical_properties
+    ):
+        return physical_properties
+
+    properties = dict(physical_properties or {})
+    unique_key: t.Optional[t.List[exp.Expression]] = model.unique_key
+    if unique_key:
+        properties["primary_key"] = (
+            unique_key[0] if len(unique_key) == 1 else exp.Tuple(expressions=unique_key)
+        )
+        logger.info(
+            "Model '%s' promoted to PRIMARY KEY table on StarRocks to support rich DELETE operations.",
+            model.name,
+        )
+    else:
+        logger.warning(
+            f"StarRocks incremental-by-unique-key model '{model.name}' requires a PRIMARY KEY table. "
+            f"Specify `physical_properties['primary_key']` or set `unique_key` on the model.",
+        )
+
+    return properties
+
+
 class MaterializableStrategy(PromotableStrategy, abc.ABC):
     def create(
         self,
@@ -2057,6 +2091,8 @@ class MaterializableStrategy(PromotableStrategy, abc.ABC):
         physical_properties = _add_unique_key_to_physical_properties_for_doris(
             model, physical_properties
         )
+        physical_properties = _ensure_primary_key_for_starrocks_when_incremental_by_unique_key(
+            model, physical_properties)
 
         logger.info("Creating table '%s'", table_name)
         if model.annotated:
@@ -2175,6 +2211,8 @@ class MaterializableStrategy(PromotableStrategy, abc.ABC):
         physical_properties = _add_unique_key_to_physical_properties_for_doris(
             model, physical_properties
         )
+        physical_properties = _ensure_primary_key_for_starrocks_when_incremental_by_unique_key(
+            model, physical_properties)
         self.adapter.replace_query(
             name,
             query_or_df,
@@ -2321,6 +2359,8 @@ class IncrementalByUniqueKeyStrategy(IncrementalStrategy):
             physical_properties = _add_unique_key_to_physical_properties_for_doris(
                 model, physical_properties
             )
+            physical_properties = _ensure_primary_key_for_starrocks_when_incremental_by_unique_key(
+                model, physical_properties)
             self.adapter.merge(
                 table_name,
                 query_or_df,
@@ -2347,6 +2387,9 @@ class IncrementalByUniqueKeyStrategy(IncrementalStrategy):
         columns_to_types, source_columns = self._get_target_and_source_columns(
             model, table_name, render_kwargs=render_kwargs
         )
+        physical_properties = kwargs.get("physical_properties", model.physical_properties)
+        physical_properties = _ensure_primary_key_for_starrocks_when_incremental_by_unique_key(
+            model, physical_properties)
         self.adapter.merge(
             table_name,
             query_or_df,
@@ -2358,7 +2401,7 @@ class IncrementalByUniqueKeyStrategy(IncrementalStrategy):
                 end=kwargs.get("end"),
                 execution_time=kwargs.get("execution_time"),
             ),
-            physical_properties=kwargs.get("physical_properties", model.physical_properties),
+            physical_properties=physical_properties,
             source_columns=source_columns,
         )
 
@@ -3132,6 +3175,8 @@ class EngineManagedStrategy(MaterializableStrategy):
             physical_properties = _add_unique_key_to_physical_properties_for_doris(
                 model, physical_properties
             )
+            physical_properties = _ensure_primary_key_for_starrocks_when_incremental_by_unique_key(
+                model, physical_properties)
             self.adapter.create_managed_table(
                 table_name=table_name,
                 query=model.render_query_or_raise(**render_kwargs),

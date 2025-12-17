@@ -21,6 +21,7 @@ Or against local StarRocks:
 
 import logging
 import os
+import re
 import typing as t
 from functools import partial
 
@@ -28,7 +29,7 @@ import pytest
 from sqlglot import exp
 
 from sqlmesh.core.engine_adapter.starrocks import StarRocksEngineAdapter
-from sqlmesh.core.model.definition import load_sql_based_model
+from sqlmesh.core.model.definition import load_sql_based_model, SqlModel
 import sqlmesh.core.dialect as d
 
 from tests.core.engine_adapter.integration import TestContext
@@ -39,6 +40,46 @@ pytestmark = [pytest.mark.starrocks, pytest.mark.docker, pytest.mark.engine]
 
 
 logger = logging.getLogger(__name__)
+
+
+def _load_sql_model(model_sql: str) -> SqlModel:
+    expressions = d.parse(model_sql, default_dialect="starrocks")
+    return t.cast(SqlModel, load_sql_based_model(expressions))
+
+
+def _materialized_properties_from_model(model: SqlModel) -> t.Optional[t.Dict[str, t.Any]]:
+    props: t.Dict[str, t.Any] = {}
+    if model.partitioned_by:
+        props["partitioned_by"] = model.partitioned_by
+    if model.clustered_by:
+        props["clustered_by"] = model.clustered_by
+    return props or None
+
+
+def _model_name_from_table(table: exp.Table) -> str:
+    if table.db:
+        return f"{table.db}.{table.name}"
+    return table.name
+
+
+def normalize_sql(sql: str) -> str:
+    """Normalizes a SQL string for comparison."""
+    # Remove comments
+    sql = re.sub(r'--.*\n', '', sql)
+    # Replace newlines and tabs with spaces
+    sql = sql.replace('\n', ' ').replace('\t', '')
+    # Collapse multiple spaces into one
+    sql = re.sub(r'\s+', ' ', sql)
+    # Remove spaces around parentheses, commas, and equals for consistency
+    sql = re.sub(r'\s*\(\s*', '(', sql)
+    sql = re.sub(r'\s*\)\s*', ')', sql)
+    sql = re.sub(r'\s*,\s*', ',', sql)
+    sql = re.sub(r'\s*=\s*', '=', sql)
+    # Remove all paired backticks around identifiers
+    sql = re.sub(r'`([^`]+)`', r'\1', sql)
+    sql = re.sub(r'\'', '"', sql)
+
+    return sql.strip()
 
 
 # =============================================================================
@@ -350,6 +391,282 @@ class TestBasicOperations:
             f"WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{view_name}'"
         )
         assert result is None, "DROP VIEW failed"
+
+
+class TestViewAndMaterializedViewFeatures:
+    """Integration tests for StarRocks view SECURITY and MV property combos."""
+
+    def test_create_view_with_security(
+        self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter
+    ):
+        source = ctx.table("sr_sec_src")
+        view = ctx.table("sr_sec_view")
+        source_sql_ident = source.sql(dialect=ctx.dialect, identify=True)
+        view_sql_ident = view.sql(dialect=ctx.dialect, identify=True)
+        view_model_name = _model_name_from_table(view)
+
+        engine_adapter.create_table(
+            source,
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                "name": exp.DataType.build("VARCHAR(100)"),
+            },
+        )
+        engine_adapter.execute(
+            f"INSERT INTO {source_sql_ident} (id, name) VALUES (1, 'Alice'), (2, 'Bob')"
+        )
+
+        model_sql = f"""
+        MODEL (
+            name {view_model_name},
+            kind VIEW,
+            dialect starrocks,
+            columns (
+                id INT,
+                name VARCHAR(100)
+            ),
+            virtual_properties (
+                security = invoker
+            )
+        );
+        SELECT id, name FROM {source_sql_ident};
+        """
+        model = _load_sql_model(model_sql)
+        query = model.render_query()
+        assert query is not None
+        engine_adapter.create_view(
+            view,
+            query,
+            replace=True,
+            target_columns_to_types=model.columns_to_types,
+            view_properties=model.virtual_properties,
+        )
+
+        ddl = engine_adapter.fetchone(f"SHOW CREATE VIEW {view_sql_ident}")[1]
+        assert "SECURITY INVOKER" in ddl.upper()
+
+    def test_create_view_replace_flag(
+        self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter
+    ):
+        source = ctx.table("sr_replace_src")
+        view = ctx.table("sr_replace_view")
+        source_sql_ident = source.sql(dialect=ctx.dialect, identify=True)
+        view_model_name = _model_name_from_table(view)
+
+        engine_adapter.create_table(
+            source,
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                "name": exp.DataType.build("VARCHAR(100)"),
+            },
+        )
+        engine_adapter.execute(
+            f"INSERT INTO {source_sql_ident} (id, name) VALUES (1, 'A')"
+        )
+
+        model_sql = f"""
+        MODEL (
+            name {view_model_name},
+            kind VIEW,
+            dialect starrocks,
+            columns (id INT, name VARCHAR(100))
+        );
+        SELECT id, name FROM {source_sql_ident};
+        """
+        model = _load_sql_model(model_sql)
+        query = model.render_query()
+        assert query is not None
+
+        # Success with replace=True to replace the old one
+        engine_adapter.create_view(
+            view,
+            query,
+            replace=True,
+            target_columns_to_types=model.columns_to_types,
+            view_properties=model.virtual_properties,
+        )
+
+        # Failed to create a view when it's existing
+        with pytest.raises(Exception):
+            engine_adapter.create_view(
+                view,
+                query,
+                replace=False,
+                target_columns_to_types=model.columns_to_types,
+                view_properties=model.virtual_properties,
+            )
+
+    def _create_sales_source_table(
+        self,
+        ctx: TestContext,
+        engine_adapter: StarRocksEngineAdapter,
+        table: exp.Table,
+    ) -> str:
+        table_sql = table.sql(dialect=ctx.dialect, identify=True)
+        engine_adapter.create_table(
+            table,
+            target_columns_to_types={
+                "order_id": exp.DataType.build("BIGINT"),
+                "customer_id": exp.DataType.build("INT"),
+                "event_date": exp.DataType.build("DATE"),
+                "amount": exp.DataType.build("DECIMAL(18,2)"),
+                "region": exp.DataType.build("VARCHAR(50)"),
+            },
+            primary_key=("order_id", "event_date"),
+            partitioned_by="event_date",
+        )
+        engine_adapter.execute(
+            f"""
+            INSERT INTO {table_sql} (order_id, customer_id, event_date, amount, region)
+            VALUES
+                (1, 1001, '2024-01-01', 10.50, 'us'),
+                (2, 1002, '2024-01-02', 20.75, 'eu')
+            """
+        )
+        return table_sql
+
+    def test_materialized_view_combo_with_materialized_properties(
+        self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter
+    ):
+        source = ctx.table("sr_mv_combo_a_src")
+        mv = ctx.table("sr_mv_combo_a")
+        mv_sql = mv.sql(dialect=ctx.dialect, identify=True)
+        source_sql = source.sql(dialect=ctx.dialect, identify=True)
+        mv_model_name = _model_name_from_table(mv)
+
+        self._create_sales_source_table(ctx, engine_adapter, source)
+
+        model_sql = f"""
+        MODEL (
+            name {mv_model_name},
+            kind VIEW (
+                materialized true
+            ),
+            dialect starrocks,
+            description 'MV combo A description',
+            columns (
+                order_id BIGINT,
+                customer_id INT,
+                event_date DATE,
+                amount DECIMAL(18,2),
+                region VARCHAR(50)
+            ),
+            column_descriptions (
+                order_id = 'Order identifier',
+                customer_id = 'Customer identifier'
+            ),
+            partitioned_by (event_date),
+            clustered_by (customer_id, region),
+            virtual_properties (
+                distributed_by = 'HASH(order_id) BUCKETS 8',
+                refresh_moment = DEFERRED,
+                refresh_scheme = 'ASYNC START (''2025-01-01 00:00:00'') EVERY (INTERVAL 5 MINUTE)',
+                replication_num = '1'
+            )
+        );
+        SELECT order_id, customer_id, event_date, amount, region
+        FROM {source_sql};
+        """
+        model = _load_sql_model(model_sql)
+        query = model.render_query()
+        assert query is not None
+        materialized_properties = _materialized_properties_from_model(model)
+
+        engine_adapter.create_view(
+            mv,
+            query,
+            replace=True,
+            materialized=True,
+            target_columns_to_types=model.columns_to_types,
+            materialized_properties=materialized_properties,
+            view_properties=model.virtual_properties,
+            table_description=model.description,
+            column_descriptions=model.column_descriptions,
+        )
+
+        ddl = engine_adapter.fetchone(f"SHOW CREATE MATERIALIZED VIEW {mv_sql}")[1]
+        logger.debug(f"mv ddl: {ddl}")
+        ddl_upper = normalize_sql(ddl).upper()
+        assert "REFRESH DEFERRED ASYNC" in ddl_upper
+        assert "START('2025-01-01 00:00:00')EVERY(INTERVAL 5 MINUTE)" in ddl_upper \
+            or 'START("2025-01-01 00:00:00")EVERY(INTERVAL 5 MINUTE)' in ddl_upper
+        assert "PARTITION BY(EVENT_DATE)" in ddl_upper
+        assert "ORDER BY(CUSTOMER_ID,REGION)" in ddl_upper
+        assert "DISTRIBUTED BY HASH(ORDER_ID)BUCKETS 8" in ddl_upper
+        assert "COMMENT 'MV COMBO A DESCRIPTION'" in ddl_upper \
+            or 'COMMENT "MV COMBO A DESCRIPTION"' in ddl_upper
+
+    def test_materialized_view_combo_all_properties_block(
+        self, ctx: TestContext, engine_adapter: StarRocksEngineAdapter
+    ):
+        source = ctx.table("sr_mv_combo_b_src")
+        mv = ctx.table("sr_mv_combo_b")
+        mv_sql = mv.sql(dialect=ctx.dialect, identify=True)
+        source_sql = source.sql(dialect=ctx.dialect, identify=True)
+        mv_model_name = _model_name_from_table(mv)
+
+        self._create_sales_source_table(ctx, engine_adapter, source)
+
+        model_sql = f"""
+        MODEL (
+            name {mv_model_name},
+            kind VIEW (
+                materialized true
+            ),
+            dialect starrocks,
+            description 'Analytics MV combo B',
+            columns (
+                order_id BIGINT,
+                customer_id INT,
+                event_date DATE,
+                amount DECIMAL(18,2)
+            ),
+            column_descriptions (
+                amount = 'Order amount'
+            ),
+            virtual_properties (
+                partition_by = event_date,
+                -- ignored when MV
+                partitions = (
+                    'PARTITION p202401 VALUES LESS THAN ("2024-02-01")',
+                    'PARTITION p202402 VALUES LESS THAN ("2024-03-01")'
+                ),
+                distributed_by = (kind=HASH, expressions=(order_id, customer_id), buckets=4),
+                order_by = (order_id, event_date),
+                refresh_scheme = MANUAL,
+                replication_num = '1'
+            )
+        );
+        SELECT order_id, customer_id, event_date, amount
+        FROM {source_sql};
+        """
+        model = _load_sql_model(model_sql)
+        query = model.render_query()
+        assert query is not None
+        materialized_properties = _materialized_properties_from_model(model)
+
+        engine_adapter.create_view(
+            mv,
+            query,
+            replace=True,
+            materialized=True,
+            target_columns_to_types=model.columns_to_types,
+            materialized_properties=materialized_properties,
+            view_properties=model.virtual_properties,
+            table_description=model.description,
+            column_descriptions=model.column_descriptions,
+        )
+
+        ddl = engine_adapter.fetchone(f"SHOW CREATE MATERIALIZED VIEW {mv_sql}")[1]
+        ddl_upper = normalize_sql(ddl).upper()
+        assert "REFRESH MANUAL" in ddl_upper
+        assert "PARTITION P202401" not in ddl_upper  # ignored when MV
+        assert "PARTITION P202402" not in ddl_upper  # ignored when MV
+        assert "PARTITION BY(EVENT_DATE)" in ddl_upper
+        assert "ORDER BY(ORDER_ID,EVENT_DATE)" in ddl_upper
+        assert "DISTRIBUTED BY HASH(ORDER_ID,CUSTOMER_ID)BUCKETS 4" in ddl_upper
+        assert "COMMENT 'ANALYTICS MV COMBO B'" in ddl_upper \
+            or 'COMMENT "ANALYTICS MV COMBO B"' in ddl_upper
 
 
 class TestTableFeatures:

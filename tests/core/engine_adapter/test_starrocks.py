@@ -21,8 +21,9 @@ import typing as t
 
 import pytest
 from sqlglot import expressions as exp
-from sqlglot import parse_one
+from sqlglot import parse, parse_one
 from pytest_mock.plugin import MockerFixture
+from sqlmesh.utils.errors import SQLMeshError
 
 from tests.core.engine_adapter import to_sql_calls
 from sqlmesh.core.engine_adapter.starrocks import StarRocksEngineAdapter
@@ -30,6 +31,12 @@ from sqlmesh.core.dialect import parse
 from sqlmesh.core.model import load_sql_based_model, SqlModel
 
 pytestmark = [pytest.mark.starrocks, pytest.mark.engine]
+
+
+def _load_sql_model(model_sql: str) -> SqlModel:
+    """Parse StarRocks MODEL SQL into a SqlModel instance."""
+    expressions = parse(model_sql, default_dialect="starrocks")
+    return t.cast(SqlModel, load_sql_based_model(expressions))
 
 
 # =============================================================================
@@ -217,6 +224,50 @@ class TestTableOperations:
             "CREATE OR REPLACE VIEW `test_view` AS SELECT `a` FROM `tbl`",
             "CREATE VIEW `test_view` AS SELECT `a` FROM `tbl`",
         ]
+
+    def test_create_view_with_security(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Test CREATE VIEW with StarRocks SECURITY property."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        adapter.create_view(
+            "test_view",
+            parse_one("SELECT a FROM tbl"),
+            replace=False,
+            view_properties={"security": exp.Var(this="INVOKER")},
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert "SECURITY INVOKER" in sql
+
+    def test_create_materialized_view_replace_with_refresh_and_comments(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Test CREATE MATERIALIZED VIEW generation (drop+create, refresh, comments, schema)."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        adapter.create_view(
+            "test_mv",
+            parse_one("SELECT a FROM tbl"),
+            materialized=True,
+            target_columns_to_types={"a": exp.DataType.build("INT")},
+            table_description="Test MV description",
+            column_descriptions={"a": "Column A description"},
+            view_properties={
+                "refresh_moment": exp.Var(this="IMMEDIATE"),
+                "refresh_scheme": exp.Literal.string(
+                    "ASYNC START ('2025-01-01 00:00:00') EVERY (INTERVAL 5 MINUTE)"
+                ),
+            },
+        )
+
+        calls = to_sql_calls(adapter)
+        assert calls[0] == "DROP MATERIALIZED VIEW IF EXISTS `test_mv`"
+        assert "CREATE MATERIALIZED VIEW" in calls[1]
+        assert "COMMENT 'Test MV description'" in calls[1]
+        assert "COMMENT 'Column A description'" in calls[1]
+        assert "REFRESH IMMEDIATE ASYNC" in calls[1]
+        assert "START ('2025-01-01 00:00:00')" in calls[1]
+        assert "EVERY (INTERVAL 5 MINUTE)" in calls[1]
 
     def test_delete_where_true_optimization(
         self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
@@ -1166,6 +1217,214 @@ class TestGenericPropertyBuilding:
 
 
 # =============================================================================
+# View Property Building
+# =============================================================================
+
+
+class TestViewPropertyBuilding:
+    """Tests for StarRocks-specific view properties (SECURITY)."""
+
+    @pytest.mark.parametrize(
+        "property_sql,expected_fragment",
+        [
+            ("INVOKER", "SECURITY INVOKER"),
+            ("'INVOKER'", "SECURITY INVOKER"),
+            ("invoker", "SECURITY INVOKER"),
+            ("NONE", "SECURITY NONE"),
+        ],
+    )
+    def test_security_value_forms(
+        self,
+        make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter],
+        property_sql: str,
+        expected_fragment: str,
+    ):
+        """Ensure different input forms render SECURITY <value>."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+
+        model_sql = f"""
+        MODEL (
+            name test_schema.test_view_security,
+            kind VIEW,
+            dialect starrocks,
+            columns (c INT),
+            virtual_properties (
+                security = {property_sql}
+            )
+        );
+        SELECT 1 AS c;
+        """
+        model = _load_sql_model(model_sql)
+
+        query = model.render_query()
+        adapter.create_view(
+            model.name,
+            query,
+            replace=False,
+            target_columns_to_types=model.columns_to_types,
+            view_properties=model.virtual_properties,
+        )
+
+        sql = to_sql_calls(adapter)[0]
+        assert expected_fragment in sql
+
+    def test_security_invalid_value(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        """Invalid SECURITY enum should raise SQLMeshError."""
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        model_sql = """
+        MODEL (
+            name test_schema.test_view_security_invalid,
+            kind VIEW,
+            dialect starrocks,
+            columns (c INT),
+            virtual_properties (
+                security = foo
+            )
+        );
+        SELECT 1 AS c;
+        """
+        model = _load_sql_model(model_sql)
+
+        query = model.render_query()
+        with pytest.raises(SQLMeshError, match="security"):
+            adapter.create_view(
+                model.name,
+                query,
+                replace=False,
+                target_columns_to_types=model.columns_to_types,
+                view_properties=model.virtual_properties,
+            )
+
+
+# =============================================================================
+# Materialized View Refresh Property Building
+# =============================================================================
+
+
+class TestMVRefreshPropertyBuilding:
+    """Tests for refresh_moment / refresh_scheme parsing and rendering."""
+
+    def _build_mv_model(self, property_sql: str) -> SqlModel:
+        model_sql = f"""
+        MODEL (
+            name test_schema.test_mv_refresh_model,
+            kind VIEW,
+            dialect starrocks,
+            columns (a INT),
+            virtual_properties (
+                {property_sql}
+            )
+        );
+        SELECT 1 AS a;
+        """
+        return _load_sql_model(model_sql)
+
+    def _create_simple_mv(
+        self,
+        adapter: StarRocksEngineAdapter,
+        model: SqlModel,
+    ) -> str:
+        query = model.render_query()
+        adapter.create_view(
+            "test_mv_refresh",
+            query,
+            replace=False,
+            materialized=True,
+            target_columns_to_types=model.columns_to_types,
+            view_properties=model.virtual_properties,
+        )
+        # replace=False → only CREATE statement is emitted
+        return to_sql_calls(adapter)[-1]
+
+    @pytest.mark.parametrize(
+        "property_sql,expected_fragment",
+        [
+            ("refresh_moment = IMMEDIATE", "REFRESH IMMEDIATE"),
+            ("refresh_moment = deferred", "REFRESH DEFERRED"),
+        ],
+    )
+    def test_refresh_moment_value_forms(
+        self,
+        make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter],
+        property_sql: str,
+        expected_fragment: str,
+    ):
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        model = self._build_mv_model(property_sql)
+        sql = self._create_simple_mv(adapter, model)
+        assert expected_fragment in sql
+
+    @pytest.mark.parametrize(
+        "property_sql,expected_fragments",
+        [
+            ("refresh_scheme = ASYNC", ["REFRESH", "ASYNC"]),
+            # single quote value with single quote start
+            (
+                "refresh_scheme = 'ASYNC START (''2025-01-01 00:00:00'') EVERY (INTERVAL 5 MINUTE)'",
+                [
+                    "REFRESH",
+                    "ASYNC",
+                    "START ('2025-01-01 00:00:00')",
+                    "EVERY (INTERVAL 5 MINUTE)",
+                ],
+            ),
+            # single quote value with double quote start
+            (
+                "refresh_scheme = 'ASYNC START (\"2025-02-01 00:00:00\") EVERY (INTERVAL 5 MINUTE)'",
+                [
+                    "REFRESH",
+                    "ASYNC",
+                    "START ('2025-02-01 00:00:00')",
+                    "EVERY (INTERVAL 5 MINUTE)",
+                ],
+            ),
+            # double quote value with single quote start
+            (
+                "refresh_scheme = \"async start ('2025-03-01') every (interval 10 minute)\"",
+                [
+                    "REFRESH",
+                    "ASYNC",
+                    "START ('2025-03-01')",
+                    "EVERY (INTERVAL 10 MINUTE)",
+                ],
+            ),
+            ("refresh_scheme = MANUAL", ["REFRESH", "MANUAL"]),
+        ],
+    )
+    def test_refresh_scheme_value_forms(
+        self,
+        make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter],
+        property_sql: str,
+        expected_fragments: t.List[str],
+    ):
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        model = self._build_mv_model(property_sql)
+        sql = self._create_simple_mv(adapter, model)
+        for fragment in expected_fragments:
+            assert fragment in sql
+
+    def test_refresh_moment_invalid_value(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        model = self._build_mv_model("refresh_moment = AUTO")
+        with pytest.raises(SQLMeshError):
+            self._create_simple_mv(adapter, model)
+
+    def test_refresh_scheme_invalid_prefix(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        model = self._build_mv_model(
+            "refresh_scheme = 'SCHEDULE EVERY (INTERVAL 5 MINUTE)'"
+        )
+        with pytest.raises(SQLMeshError, match="refresh_scheme"):
+            self._create_simple_mv(adapter, model)
+
+
+# =============================================================================
 # Comment Property Building
 # =============================================================================
 
@@ -1350,6 +1609,106 @@ class TestCommentPropertyBuilding:
         expected_truncated = "y" * 255
         assert expected_truncated in sql
         assert "yyy" * 200 not in sql  # Verify it's actually truncated
+
+
+# =============================================================================
+# Invalid Property Scenarios
+# =============================================================================
+
+
+class TestInvalidPropertyScenarios:
+    """Unit tests for property validation errors (mutual exclusivity, aliases, names)."""
+
+    def test_key_type_mutually_exclusive(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        model_sql = """
+        MODEL (
+            name test_schema.test_conflicting_keys,
+            kind FULL,
+            dialect starrocks,
+            columns (
+                id INT,
+                dt DATE,
+                value INT
+            ),
+            physical_properties (
+                primary_key = (id),
+                unique_key = (id)
+            )
+        );
+        SELECT id, dt, value FROM source_table;
+        """
+        model = _load_sql_model(model_sql)
+        columns = model.columns_to_types
+
+        with pytest.raises(SQLMeshError, match="Multiple table key type"):
+            adapter.create_table(
+                "test_conflicting_keys",
+                target_columns_to_types=columns,
+                table_properties=model.physical_properties,
+            )
+
+    def test_partition_alias_conflict_with_parameter(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        model_sql = """
+        MODEL (
+            name test_schema.test_partition_conflict,
+            kind FULL,
+            dialect starrocks,
+            columns (
+                id INT,
+                dt DATE,
+                value INT
+            ),
+            partitioned_by (dt),
+            physical_properties (
+                partition_by = (dt)
+            )
+        );
+        SELECT id, dt, value FROM source_table;
+        """
+        model = _load_sql_model(model_sql)
+
+        with pytest.raises(SQLMeshError, match="partition definition"):
+            adapter.create_table(
+                model.name,
+                target_columns_to_types=model.columns_to_types,
+                partitioned_by=model.partitioned_by,
+                table_properties=model.physical_properties,
+            )
+
+    def test_invalid_property_name_detection(
+        self, make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter]
+    ):
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter)
+        model_sql = """
+        MODEL (
+            name test_schema.test_invalid_property,
+            kind FULL,
+            dialect starrocks,
+            columns (
+                id INT,
+                dt DATE,
+                value INT
+            ),
+            physical_properties (
+                partition = dt
+            )
+        );
+        SELECT id, dt, value FROM source_table;
+        """
+        model = _load_sql_model(model_sql)
+
+        with pytest.raises(SQLMeshError, match="Invalid property 'partition'"):
+            adapter.create_table(
+                model.name,
+                target_columns_to_types=model.columns_to_types,
+                table_properties=model.physical_properties,
+            )
 
 
 # =============================================================================

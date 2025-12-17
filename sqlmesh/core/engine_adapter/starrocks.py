@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlglot
 from sqlglot import exp
 import typing as t
 
 from sqlmesh.core.engine_adapter.base import (
     InsertOverwriteStrategy,
+    get_source_columns_to_types,
 )
 from sqlmesh.core.engine_adapter.mixins import (
+    ClusteredByMixin,
     LogicalMergeMixin,
-    NonTransactionalTruncateMixin,
     PandasNativeFetchDFSupportMixin,
 )
 from sqlmesh.core.engine_adapter.shared import (
@@ -26,6 +28,7 @@ from sqlmesh.utils.errors import SQLMeshError
 
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import SchemaName, TableName
+    from sqlmesh.core.engine_adapter._typing import QueryOrDF
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,7 @@ Normalized = t.Any  # final normalized output
 # Allowed outputs for EnumType normalize / or general property outputs.
 PROPERTY_OUTPUT_TYPES = {
     "str",  # "HASH"
+    "var",  # exp.Var("ASYNC")
     "identifier",  # exp.Identifier
     "literal",  # exp.Literal.string("HASH")
     "column",  # exp.Column(this="HASH")
@@ -365,6 +369,12 @@ class EnumType(DeclarativeType):
     Enumerated value type validator.
 
     Accepts values from a predefined set of allowed values.
+    Following input types are allowed:
+    - str
+    - exp.Literal
+    - exp.Var
+    - exp.Identifier
+    - exp.Column
 
     Parameters:
     -----------
@@ -411,15 +421,14 @@ class EnumType(DeclarativeType):
         """Extract text from various value types."""
         if isinstance(value, str):
             return value
-        if isinstance(value, exp.Literal):
-            # For Literal, this is the actual value
+        if isinstance(value, (exp.Literal, exp.Var)):
             return str(value.this)
         if isinstance(value, (exp.Identifier, exp.Column)):
             # For Identifier/Column, this might be another Expression
             if isinstance(value.this, str):
                 return value.this
             elif hasattr(value.this, "name"):  # noqa: RET505
-                return value.this.name
+                return str(value.this.name)
             else:
                 return str(value.this)
         return None
@@ -459,6 +468,8 @@ class EnumType(DeclarativeType):
         # validated is already canonical (e.g., "HASH")
         if self.normalized_type is None or self.normalized_type == "str":
             return validated
+        if self.normalized_type == "var":
+            return exp.Var(this=validated)
         if self.normalized_type == "literal":
             return exp.Literal.string(validated)
         if self.normalized_type == "identifier":
@@ -1216,6 +1227,16 @@ class PropertySpecs:
     # - Multiple columns: (dt, id, status)
     OrderByInputSpec = GeneralColumnListInputSpec
 
+    # Refresh scheme: Accepts various types, normalizes to string
+    # For properties like refresh_scheme, it can be a string, identifier, or column
+    RefreshSchemeInputSpec = AnyOf(
+        EnumType(["ASYNC", "MANUAL"], normalized_type="var"),
+        ColumnType(normalized_type="str"), # Columns → will be converted to string
+        IdentifierType(normalized_type="str"), # Identifiers → will be converted to string
+        LiteralType(normalized_type="str"),    # Numbers and string literals → will be converted to string
+        StringType(),     # Plain strings
+    )
+
     # Generic property value: Accepts various types, normalizes to string
     # For properties like replication_num, storage_medium, etc.
     # StarRocks PROPERTIES syntax requires all values to be strings: "value"
@@ -1224,6 +1245,7 @@ class PropertySpecs:
         StringType(),     # Plain strings
         LiteralType(normalized_type="str"),    # Numbers and string literals → will be converted to string
         IdentifierType(normalized_type="str"), # Identifiers → will be converted to string
+        ColumnType(normalized_type="str"), # Columns → will be converted to string
     )
 
     """
@@ -1285,6 +1307,17 @@ class PropertySpecs:
         # Ordering property
         "clustered_by": OrderByInputSpec,
 
+        # View properties
+        # StarRocks syntax: SECURITY {NONE | INVOKER | DEFINDER}
+        "security": EnumType(["NONE", "INVOKER", "DEFINDER"], normalized_type="str"),
+
+        # Materialized view refresh properties (StarRocks uses REFRESH ...)
+        # - refresh_moment: IMMEDIATE | DEFERRED
+        "refresh_moment": EnumType(["IMMEDIATE", "DEFERRED"], normalized_type="str"),
+        # - refresh_scheme: ASYNC | ASYNC [START (...) EVERY (INTERVAL ...)] | MANUAL
+        #     it should be a string/literal if START/EVERY is present, other than ASYNC
+        "refresh_scheme": RefreshSchemeInputSpec,
+
         # Note: All other properties not listed here will be handled, an example here
         "replication_num": GenericPropertyInputSpec,
     }
@@ -1322,10 +1355,16 @@ class PropertySpecs:
         "partitions": SequenceOf(StringType(), allow_single=False),
         "distributed_by": AnyOf(
             DistributionTupleOutputType(),  # Try structured tuple first (most specific)
-            EnumType(["RANDOM"]),  # "RANDOM"
+            EnumType(["RANDOM"], normalized_type="str"),  # "RANDOM"
             FuncType(),  # "HASH(id)",
         ),  # Still dict | str | exp.Func after normalize
         "clustered_by": GeneralColumnListOutputSpec,
+        "security": EnumType(["NONE", "INVOKER", "DEFINDER"], normalized_type="str"),
+        "refresh_moment": EnumType(["IMMEDIATE", "DEFERRED"], normalized_type="str"),
+        "refresh_scheme": AnyOf(
+            EnumType(["ASYNC", "MANUAL"], normalized_type="var"),
+            StringType(),
+        ),
         # Generic properties use GenericPropertyOutputSpec, an example here
         "replication_num": GenericPropertyOutputSpec,
     }
@@ -1646,38 +1685,22 @@ class PropertyValidator:
 class StarRocksEngineAdapter(
     LogicalMergeMixin,
     PandasNativeFetchDFSupportMixin,
-    NonTransactionalTruncateMixin,
+    ClusteredByMixin,
 ):
     """
     StarRocks Engine Adapter for SQLMesh.
 
-    StarRocks is a high-performance analytical database that forked from Apache Doris.
-    This adapter references the Doris implementation but differs in the following key areas:
+    StarRocks is a high-performance analytical database with its own dialect-specific
+    behavior. This adapter highlights a few key characteristics:
 
-    Key Differences from Doris:
-    1. PRIMARY KEY Support:
-       - StarRocks: Native PRIMARY KEY support (no conversion needed)
-       - Doris: Uses UNIQUE KEY (requires conversion in _create_table_from_columns)
+    1. PRIMARY KEY support is native and must be emitted in the post-schema section.
+    2. DELETE with subqueries is supported on PRIMARY KEY tables, but other key types still
+       need guard rails (no boolean literals, TRUNCATE for WHERE TRUE, etc.).
+    3. Partitioning supports RANGE, LIST, and expression-based syntaxes.
 
-    2. DELETE with Subquery:
-       - StarRocks PRIMARY KEY tables: Support DELETE with subqueries directly
-       - Doris: Requires DELETE...USING syntax workaround
-
-    3. Partition Types:
-       - RANGE Partition: PARTITION BY RANGE(col) - with RANGE keyword
-       - LIST Partition: PARTITION BY LIST(col) - with LIST keyword
-       - Expression Partition: PARTITION BY (col1, col2) - no keyword
-
-    Implementation Strategy:
-    - Reference Doris implementation patterns (not inheriting)
-    - Only implement methods that differ from base or Doris behavior
-    - Most methods can use base class implementation directly
-
-    Decision Tree for Method Overriding (see starrocks_design.md Appendix A.3):
-    1. Does StarRocks syntax differ from standard SQL? → Override
-    2. Does StarRocks behave differently from Doris? → Override
-    3. Does base implementation handle it correctly? → Don't override
-    4. Is it a Doris-specific workaround not needed in StarRocks? → Don't override
+    Implementation strategy:
+    - Override only where StarRocks syntax/behavior diverges from the base adapter.
+    - Keep the rest of the functionality delegated to the shared base implementation.
     """
 
     # ==================== Class Attributes (Declarative Configuration) ====================
@@ -1685,7 +1708,7 @@ class StarRocksEngineAdapter(
     DIALECT = "starrocks"
     """SQLGlot dialect name for SQL generation"""
 
-    DEFAULT_BATCH_SIZE = 5000
+    DEFAULT_BATCH_SIZE = 10000
     """Default batch size for bulk operations"""
 
     SUPPORTS_TRANSACTIONS = False
@@ -1698,14 +1721,14 @@ class StarRocksEngineAdapter(
 
     INSERT_OVERWRITE_STRATEGY = InsertOverwriteStrategy.DELETE_INSERT
     """
-    StarRocks does support INSERT OVERWRITE syntax (dynamic overwrite from v3.5).
+    StarRocks does support INSERT OVERWRITE syntax (and dynamic overwrite from v3.5).
     Use DELETE + INSERT pattern:
     1. DELETE FROM table WHERE condition
     2. INSERT INTO table SELECT ...
 
     Base class automatically handles this strategy without overriding insert methods.
 
-    TOD: later, we can add support for INSERT OVERWRITE, even use Primary Key for beter performance
+    TODO: later, we can add support for INSERT OVERWRITE, even use Primary Key for beter performance
     """
 
     COMMENT_CREATION_TABLE = CommentCreationTable.IN_SCHEMA_DEF_CTAS
@@ -1714,11 +1737,23 @@ class StarRocksEngineAdapter(
     COMMENT_CREATION_VIEW = CommentCreationView.IN_SCHEMA_DEF_NO_COMMANDS
     """View comments are added in CREATE VIEW statement"""
 
-    MAX_TABLE_COMMENT_LENGTH = 2048
-    """Maximum length for table comments"""
+    SUPPORTS_MATERIALIZED_VIEWS = True
+    """StarRocks supports materialized views with refresh strategies"""
 
-    MAX_COLUMN_COMMENT_LENGTH = 255
-    """Maximum length for column comments"""
+    SUPPORTS_MATERIALIZED_VIEW_SCHEMA = True
+    """
+    StarRocks materialized views support specifying a column list, but the column definition is
+    limited (e.g. column name + comment, not full type definitions). We set this to True and
+    implement custom MV schema rendering in create_view/_create_materialized_view.
+    """
+
+    SUPPORTS_REPLACE_TABLE = False
+    """No REPLACE TABLE syntax; use DROP + CREATE instead"""
+
+    SUPPORTS_CREATE_DROP_CATALOG = False
+    """StarRocks supports DROPing external catalogs.
+    TODO: whether it's external catalogs, or includes the internal catalog
+    """
 
     SUPPORTS_INDEXES = True
     """
@@ -1730,34 +1765,8 @@ class StarRocksEngineAdapter(
     Supported (defined in CREATE TABLE):
     - PRIMARY KEY: Automatically creates sorted index
     - INDEX clause: For bloom filter, bitmap, inverted indexes
-
-    Example:
-        CREATE TABLE t (
-            id INT,
-            name STRING,
-            INDEX idx_name (name) USING BITMAP
-        ) PRIMARY KEY (id);  -- ✅ Supported
-
     NOT supported:
-        CREATE INDEX idx_name ON t (name);  -- ❌ Will be skipped by create_index()
-
-    """
-
-    SUPPORTS_REPLACE_TABLE = False
-    """No REPLACE TABLE syntax; use DROP + CREATE instead"""
-
-    MAX_IDENTIFIER_LENGTH = 64
-    """Maximum length for table/column names"""
-
-    SUPPORTS_MATERIALIZED_VIEWS = True
-    """StarRocks supports materialized views with refresh strategies"""
-
-    SUPPORTS_MATERIALIZED_VIEW_SCHEMA = False
-    """Materialized views can't have explicit schema definitions"""
-
-    SUPPORTS_CREATE_DROP_CATALOG = False
-    """StarRocks supports DROPing external catalogs.
-    TODO: whether it's external catalogs, or includes the internal catalog
+        CREATE INDEX idx_name ON t (name);  -- Will be skipped by create_index()
     """
 
     SUPPORTS_TUPLE_IN = False
@@ -1770,6 +1779,15 @@ class StarRocksEngineAdapter(
     This is automatically handled by snapshot_id_filter and snapshot_name_version_filter
     in sqlmesh/core/state_sync/db/utils.py when SUPPORTS_TUPLE_IN = False.
     """
+
+    MAX_TABLE_COMMENT_LENGTH = 2048
+    """Maximum length for table comments"""
+
+    MAX_COLUMN_COMMENT_LENGTH = 255
+    """Maximum length for column comments"""
+
+    MAX_IDENTIFIER_LENGTH = 64
+    """Maximum length for table/column names"""
 
     # ==================== Schema Operations ====================
     # StarRocks supports CREATE/DROP SCHEMA the same as CREATE/DROP DATABSE.
@@ -1784,8 +1802,9 @@ class StarRocksEngineAdapter(
         Returns all the data objects that exist in the given schema.
         Uses information_schema tables which are compatible with MySQL protocol.
 
-        StarRocks shares the same information_schema structure with Doris/MySQL,
-        so we use the same implementation.
+        StarRocks uses the MySQL-compatible information_schema layout, so the same query
+        works here.
+        TODO: Materialized View is not distinguished from View (both are categoried as `VIEW`)
 
         Args:
             schema_name: The schema (database) to query
@@ -1798,13 +1817,13 @@ class StarRocksEngineAdapter(
             exp.select(
                 exp.column("table_schema").as_("schema_name"),
                 exp.column("table_name").as_("name"),
-                exp.case()
+                exp.case(exp.column("table_type"))
                 .when(
-                    exp.column("table_type").eq("BASE TABLE"),
+                    exp.Literal.string("BASE TABLE"),
                     exp.Literal.string("table"),
                 )
                 .when(
-                    exp.column("table_type").eq("VIEW"),
+                    exp.Literal.string("VIEW"),
                     exp.Literal.string("view"),
                 )
                 .else_("table_type")
@@ -1821,13 +1840,12 @@ class StarRocksEngineAdapter(
                 exp.func("LOWER", exp.column("table_name")).isin(*lowered_names)
             )
 
-        # TODO: MV is not distinguished from View (both are categoried as `VIEW`)
         df = self.fetchdf(query)
         return [
             DataObject(
                 schema=row.schema_name,
                 name=row.name,
-                type=DataObjectType.from_str(row.type),  # type: ignore
+                type=DataObjectType.from_str(row.type),
             )
             for row in df.itertuples()
         ]
@@ -1850,13 +1868,12 @@ class StarRocksEngineAdapter(
         Since SQLMesh state tables use PRIMARY KEY (which provides efficient indexing),
         we simply log and skip additional index creation requests.
 
-        This is a known limitation also present in Doris, which incorrectly allows
-        CREATE INDEX to be attempted.
+        This matches upstream StarRocks limitations and prevents accidental CREATE INDEX calls.
         """
         logger.warning(
-            f"Skipping CREATE INDEX {index_name} on {table_name} - "
-            "StarRocks does not support standalone CREATE INDEX statements. "
-            "PRIMARY KEY provides equivalent indexing for columns: {columns}"
+            f"[StarRocks] Skipping CREATE INDEX {index_name} on {table_name} - "
+            f"StarRocks does not support standalone CREATE INDEX statements. "
+            f"PRIMARY KEY provides equivalent indexing for columns: {columns}"
         )
         return
 
@@ -2091,6 +2108,8 @@ class StarRocksEngineAdapter(
                 if isinstance(e, exp.Select) and e.args.get("locks"):
                     e = e.copy()
                     e.set("locks", None)
+                    logger.warning(f"[StarRocks] Removed FOR UPDATE from SELECT statement: "
+                        f"{e.sql(dialect=self.dialect, identify=quote_identifiers)}")
                 processed_expressions.append(e)
             else:
                 # For string SQL, we can't easily remove FOR UPDATE without parsing
@@ -2229,6 +2248,195 @@ class StarRocksEngineAdapter(
             **kwargs,
         )
 
+    # ==================== View / Materialized View ====================
+    def create_view(
+        self,
+        view_name: TableName,
+        query_or_df: QueryOrDF,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        replace: bool = True,
+        materialized: bool = False,
+        materialized_properties: t.Optional[t.Dict[str, t.Any]] = None,
+        table_description: t.Optional[str] = None,
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+        view_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
+        source_columns: t.Optional[t.List[str]] = None,
+        **create_kwargs: t.Any,
+    ) -> None:
+        """
+        StarRocks behavior:
+        - Regular VIEW: supports CREATE OR REPLACE (base behavior)
+        - MATERIALIZED VIEW: does NOT support CREATE OR REPLACE, so replace=True => DROP + CREATE
+        """
+        if not materialized:
+            return super().create_view(
+                view_name=view_name,
+                query_or_df=query_or_df,
+                target_columns_to_types=target_columns_to_types,
+                replace=replace,
+                materialized=False,
+                materialized_properties=materialized_properties,
+                table_description=table_description,
+                column_descriptions=column_descriptions,
+                view_properties=view_properties,
+                source_columns=source_columns,
+                **create_kwargs,
+            )
+
+        # MATERIALIZED VIEW path
+        if replace:
+            # Avoid DROP MATERIALIZED VIEW failure when an object with the same name exists but is not an MV.
+            self.drop_data_object_on_type_mismatch(
+                self.get_data_object(view_name), DataObjectType.VIEW
+            )
+            self.drop_view(view_name, ignore_if_not_exists=True, materialized=True)
+
+        return self._create_materialized_view(
+            view_name=view_name,
+            query_or_df=query_or_df,
+            target_columns_to_types=target_columns_to_types,
+            materialized_properties=materialized_properties,
+            table_description=table_description,
+            column_descriptions=column_descriptions,
+            view_properties=view_properties,
+            source_columns=source_columns,
+            **create_kwargs,
+        )
+
+    def _create_materialized_view(
+        self,
+        view_name: TableName,
+        query_or_df: QueryOrDF,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        materialized_properties: t.Optional[t.Dict[str, t.Any]] = None,
+        table_description: t.Optional[str] = None,
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+        view_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
+        source_columns: t.Optional[t.List[str]] = None,
+        **create_kwargs: t.Any,
+    ) -> None:
+        """
+        Create a StarRocks materialized view.
+
+        StarRocks MV schema supports a column list but does NOT support explicit data types in that list.
+        We therefore build a schema with column names + optional COMMENT only.
+        """
+        import pandas as pd
+
+        query_or_df = self._native_df_to_pandas_df(query_or_df)
+
+        if isinstance(query_or_df, pd.DataFrame):
+            values: t.List[t.Tuple[t.Any, ...]] = list(
+                query_or_df.itertuples(index=False, name=None)
+            )
+            target_columns_to_types, source_columns = self._columns_to_types(
+                query_or_df, target_columns_to_types, source_columns
+            )
+            if not target_columns_to_types:
+                raise SQLMeshError("columns_to_types must be provided for dataframes")
+            source_columns_to_types = get_source_columns_to_types(
+                target_columns_to_types, source_columns
+            )
+            query_or_df = self._values_to_sql(
+                values,
+                source_columns_to_types,
+                batch_start=0,
+                batch_end=len(values),
+            )
+
+        source_queries, target_columns_to_types = self._get_source_queries_and_columns_to_types(
+            query_or_df,
+            target_columns_to_types,
+            batch_size=0,
+            target_table=view_name,
+            source_columns=source_columns,
+        )
+        if len(source_queries) != 1:
+            raise SQLMeshError("Only one source query is supported for creating materialized views")
+
+        target_table = exp.to_table(view_name)
+        schema: t.Union[exp.Table, exp.Schema] = self._build_materialized_view_schema_exp(
+            target_table,
+            target_columns_to_types=target_columns_to_types,
+            column_descriptions=column_descriptions,
+        )
+
+        # Pass model materialized properties through the existing properties builder
+        partitioned_by = None
+        clustered_by = None
+        partition_interval_unit = None
+        if materialized_properties:
+            partitioned_by = materialized_properties.get("partitioned_by")
+            clustered_by = materialized_properties.get("clustered_by")
+            partition_interval_unit = materialized_properties.get("partition_interval_unit")
+
+        properties_exp = self._build_table_properties_exp(
+            catalog_name=target_table.catalog,
+            table_properties=view_properties,
+            target_columns_to_types=target_columns_to_types,
+            table_description=table_description,
+            partitioned_by=partitioned_by,
+            clustered_by=clustered_by,
+            partition_interval_unit=partition_interval_unit,
+            table_kind="MATERIALIZED_VIEW",
+        )
+
+        with source_queries[0] as query:
+            self.execute(
+                exp.Create(
+                    this=schema,
+                    kind="VIEW",
+                    replace=False,
+                    expression=query,
+                    properties=properties_exp,
+                    **create_kwargs,
+                ),
+                quote_identifiers=self.QUOTE_IDENTIFIERS_IN_VIEWS,
+            )
+
+        self._clear_data_object_cache(view_name)
+
+    def _build_materialized_view_schema_exp(
+        self,
+        table: exp.Table,
+        *,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+    ) -> t.Union[exp.Table, exp.Schema]:
+        """
+        Build a StarRocks MV schema with column names + optional COMMENT only (no types).
+        """
+        columns: t.List[str] = []
+        if target_columns_to_types:
+            columns = list(target_columns_to_types)
+        elif column_descriptions:
+            columns = list(column_descriptions)
+
+        if not columns:
+            return table
+
+        column_descriptions = column_descriptions or {}
+        expressions: t.List[exp.Expression] = []
+        for col in columns:
+            constraints: t.List[exp.ColumnConstraint] = []
+            comment = column_descriptions.get(col)
+            if comment:
+                constraints.append(
+                    exp.ColumnConstraint(
+                        kind=exp.CommentColumnConstraint(
+                            this=exp.Literal.string(self._truncate_column_comment(comment))
+                        )
+                    )
+                )
+            expressions.append(
+                exp.ColumnDef(
+                    this=exp.to_identifier(col),
+                    constraints=constraints,
+                )
+            )
+
+        return exp.Schema(this=table, expressions=expressions)
+
     def _build_table_properties_exp(
         self,
         catalog_name: t.Optional[str] = None,
@@ -2288,6 +2496,11 @@ class StarRocksEngineAdapter(
             table_properties.keys() if table_properties else [],
         )
 
+        is_mv = table_kind == "MATERIALIZED_VIEW"
+        if is_mv:
+            # Required for CREATE MATERIALIZED VIEW (SQLGlot uses this property to switch the keyword)
+            properties.append(exp.MaterializedProperty())
+
         # Validate all property names at once
         PropertyValidator.check_all_invalid_names(table_properties_copy)
 
@@ -2301,6 +2514,11 @@ class StarRocksEngineAdapter(
         logger.debug(
             "_build_table_properties_exp: active_key_type='%s'", active_key_type
         )
+        if is_mv and active_key_type:
+            raise SQLMeshError(
+                f"You can't specify the table type when the table is a materialized view. "
+                f"Current specified key type '{active_key_type}'."
+            )
 
         # 0. Extract key columns for partition/distribution validation (read-only, don't pop yet)
         key_type, key_columns = None, None
@@ -2331,7 +2549,7 @@ class StarRocksEngineAdapter(
         else:
             logger.debug("_build_table_properties_exp: key_prop skipped (not defined)")
 
-        # 2. Add table comment
+        # 2. Add table comment (it must be ahead of other properties except the talbe key/type)
         if table_description:
             properties.append(
                 exp.SchemaCommentProperty(
@@ -2377,7 +2595,16 @@ class StarRocksEngineAdapter(
                 "_build_table_properties_exp: distributed_prop skipped (not defined)"
             )
 
-        # 5. Handle order_by/clustered_by (ORDER BY ...)
+        # 5. Handle refresh_property (REFRESH ...)
+        if is_mv:
+            refresh_prop = self._build_refresh_property(table_properties_copy)
+            if refresh_prop:
+                properties.append(refresh_prop)
+                logger.debug("_build_table_properties_exp: generated refresh_prop=%s", type(refresh_prop).__name__)
+            else:
+                logger.debug("_build_table_properties_exp: refresh_prop skipped (not defined)")
+
+        # 6. Handle order_by/clustered_by (ORDER BY ...)
         order_prop = self._build_order_by_property(
             table_properties_copy, clustered_by or None
         )
@@ -2397,6 +2624,43 @@ class StarRocksEngineAdapter(
         properties.extend(other_props)
 
         return exp.Properties(expressions=properties) if properties else None
+
+    def _build_view_properties_exp(
+        self,
+        view_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
+        table_description: t.Optional[str] = None,
+        **kwargs: t.Any,
+    ) -> t.Optional[exp.Properties]:
+        """
+        Build CREATE VIEW properties for StarRocks.
+
+        Supports StarRocks view SECURITY syntax: SECURITY {NONE | INVOKER}
+        via exp.SecurityProperty (renders as `SECURITY <value>`).
+        """
+        properties: t.List[exp.Expression] = []
+
+        if table_description:
+            properties.append(
+                exp.SchemaCommentProperty(
+                    this=exp.Literal.string(self._truncate_table_comment(table_description))
+                )
+            )
+
+        if view_properties:
+            view_properties_copy = dict(view_properties)
+            security = view_properties_copy.pop("security", None)
+            if security is not None:
+                security_text = PropertyValidator.validate_and_normalize_property("security", security)
+                # exp.SecurityProperty renders as `SECURITY <value>` (no '=')
+                properties.append(exp.SecurityProperty(this=exp.Var(this=security_text)))
+
+            properties.extend(
+                self._table_or_view_properties_to_expressions(view_properties_copy)
+            )
+
+        if properties:
+            return exp.Properties(expressions=properties)
+        return None
 
     def _build_table_key_property(
         self, table_properties: t.Dict[str, t.Any], active_key_type: t.Optional[str]
@@ -2808,6 +3072,99 @@ class StarRocksEngineAdapter(
         )
         return result
 
+    def _build_refresh_property(
+        self, table_properties: t.Dict[str, t.Any]
+    ) -> t.Optional[exp.RefreshTriggerProperty]:
+        """
+        Build StarRocks MV REFRESH clause as exp.RefreshTriggerProperty.
+
+        Input (from physical_properties):
+        - refresh_moment: IMMEDIATE | DEFERRED (optional)
+        - refresh_scheme: MANUAL | ASYNC [START (<start_time>)] EVERY (INTERVAL <n> <unit>) (optional)
+
+        Output mapping (to match sqlglot StarRocks generator refreshtriggerproperty_sql):
+        - method: refresh_moment when provided; otherwise a sentinel that won't render
+        - kind: ASYNC | MANUAL
+        - starts/every/unit: parsed from refresh_scheme if present
+        """
+        refresh_moment = table_properties.pop("refresh_moment", None)
+        refresh_scheme = table_properties.pop("refresh_scheme", None)
+        if refresh_moment is None and refresh_scheme is None:
+            return None
+
+        # method is required by exp.RefreshTriggerProperty, but StarRocks syntax does NOT support AUTO.
+        # We use a sentinel value that the StarRocks generator will not render (it only renders
+        # IMMEDIATE/DEFERRED).
+        method_expr = exp.Var(this="UNSPECIFIED")
+        if refresh_moment is not None:
+            refresh_moment_text = PropertyValidator.validate_and_normalize_property(
+                "refresh_moment", refresh_moment
+            )
+            method_expr = exp.Var(this=refresh_moment_text)
+
+        kind_expr: t.Optional[exp.Expression] = None
+        starts_expr: t.Optional[exp.Expression] = None
+        every_expr: t.Optional[exp.Expression] = None
+        unit_expr: t.Optional[exp.Expression] = None
+
+        if refresh_scheme is not None:
+            scheme_text = PropertyValidator.validate_and_normalize_property(
+                "refresh_scheme", refresh_scheme
+            )
+            if isinstance(scheme_text, exp.Var):
+                kind_expr = scheme_text
+            else:
+                kind_expr, starts_expr, every_expr, unit_expr = self._parse_refresh_scheme(scheme_text)
+
+        return exp.RefreshTriggerProperty(
+            method=method_expr,
+            kind=kind_expr,
+            starts=starts_expr,
+            every=every_expr,
+            unit=unit_expr,
+        )
+
+    def _parse_refresh_scheme(
+        self, refresh_scheme: str
+    ) -> t.Tuple[
+        t.Optional[exp.Expression],
+        t.Optional[exp.Expression],
+        t.Optional[exp.Expression],
+        t.Optional[exp.Expression],
+    ]:
+        """
+        Parse StarRocks refresh_scheme text into (kind, starts, every, unit).
+
+        parsing simple and robust. We only extract:
+        - kind: ASYNC | MANUAL (must appear at the beginning), None if not provided
+        - starts: START (<start_time>) where <start_time> is treated as a raw string
+        - every/unit: EVERY (INTERVAL <n> <unit>)
+        """
+        text = (refresh_scheme or "").strip()
+        if not text:
+            return None, None, None, None
+
+        m_kind = re.match(r"^(MANUAL|ASYNC)\b", text, flags=re.IGNORECASE)
+        if not m_kind:
+            raise SQLMeshError(
+                f"[StarRocks] Invalid refresh_scheme {refresh_scheme!r}. Expected to start with MANUAL or ASYNC."
+            )
+        kind = m_kind.group(1).upper()
+        kind_expr: t.Optional[exp.Expression] = exp.Var(this=kind)
+
+        starts_expr: t.Optional[exp.Expression] = None
+        every_expr: t.Optional[exp.Expression] = None
+        unit_expr: t.Optional[exp.Expression] = None
+        m_start = re.search(r"\bSTART\s*\(\s*(?:'([^']*)'|\"([^\"]*)\"|([^)]*))\s*\)", text, flags=re.IGNORECASE)
+        if m_start:
+            start_inner = (m_start.group(1) or m_start.group(2) or m_start.group(3) or "").strip()
+            starts_expr = exp.Literal.string(start_inner)
+        m_every = re.search(r"\bEVERY\s*\(\s*INTERVAL\s+(\d+)\s+(\w+)\s*\)", text, flags=re.IGNORECASE)
+        if m_every:
+            every_expr = exp.Literal.number(int(m_every.group(1)))
+            unit_expr = exp.Var(this=m_every.group(2).upper())
+        return kind_expr, starts_expr, every_expr, unit_expr
+
     def _parse_distribution_with_buckets(
         self, distributed_by: t.Any
     ) -> t.Optional[t.Dict[str, t.Any]]:
@@ -2829,8 +3186,6 @@ class StarRocksEngineAdapter(
             Returns None if not a complex BUCKETS expression
             (The output function will still handle "HASH(id)" without BUCKETS)
         """
-        import re
-
         # Only handle string or Literal string values
         logger.debug(
             "_parse_distribution_with_buckets: distributed_by: %s, type: %s",
@@ -3006,7 +3361,7 @@ class StarRocksEngineAdapter(
         # Use PropertyValidator to check mutual exclusion
         active_key_type = PropertyValidator.check_at_most_one(
             property_name="key_type",  # dummy
-            property_description="StarRocks table type",
+            property_description="table key type",
             table_properties=table_properties,
             parameter_value=primary_key,
         )
@@ -3168,50 +3523,7 @@ class StarRocksEngineAdapter(
 
         return f"ALTER TABLE {table_sql} MODIFY COLUMN {column_sql} COMMENT {comment_sql}"
 
-    # ==================== Methods to Consider Overriding (Future Implementation) ====================
-
-    # TODO: _get_data_objects()
-    # Purpose: Query information_schema to list tables/views
-    # Override Decision: Probably NO - Doris implementation should work (MySQL-compatible)
-    # Reference: doris.py uses information_schema.tables
-
-    # TODO: create_view()
-    # Purpose: Create regular and materialized views
-    # Override Decision: MAYBE - Check if StarRocks materialized view syntax differs from Doris
-    # Reference: doris.py has _create_materialized_view() for complex properties
-
-    # TODO: delete_from()
-    # Purpose: Delete rows from table
-    # Override Decision: MAYBE
-    # - StarRocks PRIMARY KEY tables support DELETE with subqueries (no USING workaround needed)
-    # - Other table types (DUPLICATE/AGGREGATE) may still need Doris-style handling
-    # Reference: doris.py converts DELETE...IN (SELECT) to DELETE...USING
-
-    # TODO: _build_table_properties_exp()
-    # Purpose: Build table properties (PARTITION BY, DISTRIBUTED BY, etc.)
-    # Override Decision: MAYBE
-    # - Check if StarRocks partition syntax (RANGE/LIST/Expression) needs special handling
-    # - distributed_by, buckets should be same as Doris
-    # Reference: doris.py has complex _build_table_properties_exp()
-
-    # TODO: _build_partitioned_by_exp()
-    # Purpose: Build partition expressions
-    # Override Decision: MAYBE
-    # - StarRocks has 3 partition types: RANGE, LIST, Expression
-    # - May need special handling for expression partitions
-    # Reference: doris.py handles RANGE and LIST partitions
-
-    # TODO: create_table_like()
-    # Purpose: CREATE TABLE ... LIKE ...
-    # Override Decision: Probably NO - Standard syntax should work
-
-    # TODO: _create_table_comment() / _build_create_comment_column_exp()
-    # Purpose: Add/modify table and column comments
-    # Override Decision: Probably NO - Doris implementation should work
-    # Uses: ALTER TABLE ... MODIFY COMMENT / MODIFY COLUMN ... COMMENT
-
     # ==================== Methods NOT Needing Override (Base Class Works) ====================
-
     # The following methods work correctly with base class implementation:
     # - columns(): Query column definitions via DESCRIBE TABLE
     # - table_exists(): Check if table exists via information_schema
@@ -3220,17 +3532,3 @@ class StarRocksEngineAdapter(
     # - fetchall() / fetchone(): Standard query execution
     # - execute(): Base SQL execution
     # - create_table_properties(): Delegate to _build_table_properties_exp()
-
-    # ==================== Notes on SQLGlot Support ====================
-
-    # SQLGlot StarRocks Dialect Status:
-    # - Location: sqlglot/dialects/starrocks.py
-    # - Inheritance: Inherits from MySQL (not Doris!)
-    # - PRIMARY KEY: Already supported (placed in POST_SCHEMA location)
-    # - Partition expressions: Should be supported
-    #
-    # If SQLGlot is missing features, we have two options:
-    # 1. Implement workaround in this adapter (temporary)
-    # 2. Contribute to SQLGlot repository (long-term)
-    #
-    # See starrocks_design.md for detailed SQLGlot modification tracking
