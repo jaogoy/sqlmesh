@@ -1804,7 +1804,9 @@ class StarRocksEngineAdapter(
 
         StarRocks uses the MySQL-compatible information_schema layout, so the same query
         works here.
-        TODO: Materialized View is not distinguished from View (both are categoried as `VIEW`)
+        Note: Materialized View is not reliably distinguished from View (both may appear as `VIEW`)
+        in information_schema.tables. We therefore best-effort detect MVs via
+        information_schema.materialized_views and upgrade matching objects to `materialized_view`.
 
         Args:
             schema_name: The schema (database) to query
@@ -1813,6 +1815,7 @@ class StarRocksEngineAdapter(
         Returns:
             List of DataObject instances representing tables and views
         """
+        schema_db = to_schema(schema_name).db
         query = (
             exp.select(
                 exp.column("table_schema").as_("schema_name"),
@@ -1830,7 +1833,7 @@ class StarRocksEngineAdapter(
                 .as_("type"),
             )
             .from_(exp.table_("tables", db="information_schema"))
-            .where(exp.column("table_schema").eq(to_schema(schema_name).db))
+            .where(exp.column("table_schema").eq(schema_db))
         )
         if object_names:
             # StarRocks may treat information_schema table_name comparisons as case-sensitive.
@@ -1841,7 +1844,7 @@ class StarRocksEngineAdapter(
             )
 
         df = self.fetchdf(query)
-        return [
+        objects = [
             DataObject(
                 schema=row.schema_name,
                 name=row.name,
@@ -1849,6 +1852,35 @@ class StarRocksEngineAdapter(
             )
             for row in df.itertuples()
         ]
+
+        # Best-effort upgrade of MV types using information_schema.materialized_views.
+        # If this fails (unsupported / permissions / version), fall back to information_schema.tables.
+        try:
+            mv_query = (
+                exp.select(
+                    exp.column("table_schema").as_("schema_name"),
+                    exp.column("table_name").as_("name"),
+                )
+                .from_(exp.table_("materialized_views", db="information_schema"))
+                .where(exp.column("table_schema").eq(schema_db))
+            )
+            if object_names:
+                lowered_names = [name.lower() for name in object_names]
+                mv_query = mv_query.where(
+                    exp.func("LOWER", exp.column("table_name")).isin(*lowered_names)
+                )
+
+            mv_df = self.fetchdf(mv_query)
+            mv_names: t.Set[str] = {t.cast(str, r.name).lower() for r in mv_df.itertuples() if r.name}
+
+            if mv_names:
+                for obj in objects:
+                    if obj.name.lower() in mv_names:
+                        obj.type = DataObjectType.MATERIALIZED_VIEW
+        except Exception:
+            logger.warning(f"[StarRocks] Failed to get materialized views from information_schema.materialized_views")
+
+        return objects
 
     # ==================== Index Operations ====================
 
@@ -1967,7 +1999,7 @@ class StarRocksEngineAdapter(
 
             if where != original_where:
                 logger.debug(
-                    f"Converted WHERE clause for StarRocks compatibility:\n"
+                    f"Converted WHERE clause for StarRocks compatibility, table: {table_name}.\n"
                     f"  Original: {original_where.sql(dialect=self.dialect)}\n"
                     f"  Converted: {where.sql(dialect=self.dialect)}"
                 )
@@ -2287,9 +2319,14 @@ class StarRocksEngineAdapter(
         if replace:
             # Avoid DROP MATERIALIZED VIEW failure when an object with the same name exists but is not an MV.
             self.drop_data_object_on_type_mismatch(
-                self.get_data_object(view_name), DataObjectType.VIEW
+                self.get_data_object(view_name), DataObjectType.MATERIALIZED_VIEW
             )
             self.drop_view(view_name, ignore_if_not_exists=True, materialized=True)
+        logger.debug(
+            f"Creating materialized view: {view_name}, materialized: {materialized}, "
+            f"materialized_properties: {materialized_properties}, "
+            f"view_properties: {view_properties}, create_kwargs: {create_kwargs}, "
+        )
 
         return self._create_materialized_view(
             view_name=view_name,
@@ -2369,6 +2406,10 @@ class StarRocksEngineAdapter(
             partitioned_by = materialized_properties.get("partitioned_by")
             clustered_by = materialized_properties.get("clustered_by")
             partition_interval_unit = materialized_properties.get("partition_interval_unit")
+            logger.debug(f"Get info from materialized_properties: {materialized_properties}, "
+                         f"partitioned_by: {partitioned_by}, "
+                         f"clustered_by: {clustered_by}, "
+                         f"partition_interval_unit: {partition_interval_unit}")
 
         properties_exp = self._build_table_properties_exp(
             catalog_name=target_table.catalog,

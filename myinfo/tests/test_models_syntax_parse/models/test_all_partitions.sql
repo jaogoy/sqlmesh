@@ -22,8 +22,8 @@ MODEL (
 
     -- Partition definitions
     /* partitions = (
-      'PARTITION p1 VALUES LESS THAN ("2024-01-01", "region1")',
-      'PARTITION p2 VALUES LESS THAN ("2024-06-01", "region2")',
+      'PARTITION p1 VALUES LESS THAN ("2025-01-01", "region1")',
+      'PARTITION p2 VALUES LESS THAN ("2025-06-01", "region2")',
       'PARTITION p3 VALUES LESS THAN (MAXVALUE, MAXVALUE)'
     ), */
 

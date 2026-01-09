@@ -23,6 +23,7 @@ import pytest
 from sqlglot import expressions as exp
 from sqlglot import parse, parse_one
 from pytest_mock.plugin import MockerFixture
+from sqlmesh.core.engine_adapter.shared import DataObjectType
 from sqlmesh.utils.errors import SQLMeshError
 
 from tests.core.engine_adapter import to_sql_calls
@@ -84,6 +85,74 @@ class TestSchemaOperations:
             "DROP SCHEMA IF EXISTS `test_schema`",
             "DROP SCHEMA `test_schema`",
         ]
+
+
+# =============================================================================
+# Data Object Query (MV vs VIEW)
+# =============================================================================
+class TestDataObjectQuery:
+    def test_get_data_object_materialized_view_is_distinguished_from_view(
+        self,
+        make_mocked_engine_adapter: t.Callable[..., StarRocksEngineAdapter],
+        mocker: MockerFixture,
+    ) -> None:
+        """
+        StarRocks may report materialized views as TABLE_TYPE='VIEW' in information_schema.tables.
+        Ensure StarRocksEngineAdapter upgrades MV objects using information_schema.materialized_views.
+        """
+        import pandas as pd
+
+        adapter = make_mocked_engine_adapter(StarRocksEngineAdapter, patch_get_data_objects=False)
+
+        # information_schema.tables output (MV appears as 'view')
+        # fetchdf is called twice:
+        # 1) information_schema.tables
+        # 2) information_schema.materialized_views
+        tables_df = pd.DataFrame(
+            [
+                {"schema_name": "test_db", "name": "mv1", "type": "view"},
+                {"schema_name": "test_db", "name": "mv2", "type": "view"},
+                {"schema_name": "test_db", "name": "v1", "type": "view"},
+                {"schema_name": "test_db", "name": "t1", "type": "table"},
+            ]
+        )
+        mv_df = pd.DataFrame(
+            [
+                {"schema_name": "test_db", "name": "mv1"},
+                {"schema_name": "test_db", "name": "mv2"},
+            ]
+        )
+
+        known_names = ["mv1", "mv2", "v1", "t1"]
+
+        def fetchdf_side_effect(query: exp.Expression, *_: t.Any, **__: t.Any):
+            query_sql = query.sql(dialect="starrocks").lower()
+            requested = [
+                name for name in known_names if f"'{name}'" in query_sql or f"`{name}`" in query_sql
+            ]
+            if "information_schema.materialized_views" in query_sql:
+                df = mv_df
+            else:
+                df = tables_df
+            if requested:
+                mask = df["name"].str.lower().isin(requested)
+                return df[mask].reset_index(drop=True)
+            return df.reset_index(drop=True)
+
+        adapter.fetchdf = mocker.Mock(side_effect=fetchdf_side_effect)
+
+        mv1 = adapter.get_data_object("test_db.mv1")
+        assert mv1 is not None
+        assert mv1.type == DataObjectType.MATERIALIZED_VIEW
+
+        v1 = adapter.get_data_object("test_db.v1")
+        assert v1 is not None
+        assert v1.type == DataObjectType.VIEW
+
+        mv2_objects = adapter.get_data_objects(schema_name="test_db", object_names={"mv2"})
+        assert len(mv2_objects) == 1
+        assert mv2_objects[0].name.lower() == "mv2"
+        assert mv2_objects[0].type == DataObjectType.MATERIALIZED_VIEW
 
 
 # =============================================================================

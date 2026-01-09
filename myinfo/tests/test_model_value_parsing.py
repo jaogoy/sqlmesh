@@ -193,7 +193,7 @@ class TestRealModelValueParsing:
             )
         );
 
-        SELECT 1 as id, '2024-01-01' as dt, NOW() as ts, 'US' as region;
+        SELECT 1 as id, '2025-01-01' as dt, NOW() as ts, 'US' as region;
         """
 
         # Parse using SQLMesh
@@ -287,7 +287,7 @@ class TestRealModelValueParsing:
 
         SELECT
             1 as id,
-            '2024-01-01' as dt,
+            '2025-01-01' as dt,
             NOW() as ts,
             'US' as region,
             1 as col1,

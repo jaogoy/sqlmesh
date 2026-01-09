@@ -2744,12 +2744,20 @@ class ViewStrategy(PromotableStrategy):
             return
 
         logger.info("Replacing view '%s'", table_name)
+        materialized_properties = None
+        if is_materialized_view:
+            materialized_properties = {
+                "partitioned_by": model.partitioned_by,
+                "clustered_by": model.clustered_by,
+                "partition_interval_unit": model.partition_interval_unit,
+            }
         self.adapter.create_view(
             table_name,
             query_or_df,
             model.columns_to_types,
             replace=must_recreate_view,
             materialized=is_materialized_view,
+            materialized_properties=materialized_properties,
             view_properties=kwargs.get("physical_properties", model.physical_properties),
             table_description=model.description,
             column_descriptions=model.column_descriptions,

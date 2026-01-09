@@ -20,9 +20,9 @@ MODEL (
 
     -- Partition Definitions (explicit partitions)
     partitions = (
-      'PARTITION p1 VALUES LESS THAN ("2024-01-01", "US")',
-      'PARTITION p2 VALUES LESS THAN ("2024-01-01", "EU")',
-      'PARTITION p3 VALUES LESS THAN ("2024-06-01", "US")',
+      'PARTITION p1 VALUES LESS THAN ("2025-01-01", "US")',
+      'PARTITION p2 VALUES LESS THAN ("2025-01-01", "EU")',
+      'PARTITION p3 VALUES LESS THAN ("2025-06-01", "US")',
       'PARTITION p4 VALUES LESS THAN (MAXVALUE, MAXVALUE)'
     ),
 
@@ -38,7 +38,7 @@ MODEL (
     -- Storage Properties
     replication_num = 3,
     storage_medium = "SSD",
-    storage_cooldown_time = "2024-12-31 23:59:59",
+    storage_cooldown_time = "2025-12-31 23:59:59",
 
     -- Compression
     compression = "LZ4",

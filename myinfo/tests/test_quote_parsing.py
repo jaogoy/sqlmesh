@@ -176,7 +176,7 @@ class TestQuoteCharacterConfiguration:
             )
         );
 
-        SELECT 1 as id, '2024-01-01' as dt;
+        SELECT 1 as id, '2025-01-01' as dt;
         """
 
         # Parse using SQLMesh
