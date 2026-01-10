@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../sqlglot"
+		},
+		{
+			"path": "../../../repo/my/iassistant"
+		},
+		{
+			"path": "../../../code/starrocks-code/starrocks-upstream/fe/fe-grammar/bin/main/com/starrocks/grammar"
+		}
+	],
+	"settings": {
+		"makefile.configureOnOpen": false
+	}
+}

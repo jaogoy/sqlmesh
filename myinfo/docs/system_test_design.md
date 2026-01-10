@@ -277,8 +277,8 @@ system_test_project/
 
 #### 步骤（ST-03）
 
-1. 修改 `models/orders_incremental.sql` 如上，并在 `models/orders_summary_mv.sql` 中引用新列（例如增加 `SUM(amount_double)` 或保留原列以确保 schema 对齐）
-   > 不过当前不新增的情况下，`orders_summary_mv` 也会被认定 `Indirect breaking`.
+1. 修改 `models/orders_incremental.sql` 如上，增加新列（保留原列以确保 schema 对齐，不影响downstream的schema和数据）
+   > 在当前不修改原有列的情况下，`orders_summary_mv` 也会被认定 `Indirect breaking`.
 2. 执行 plan（选择 ST-02 之后的时间窗口，例如 2025-02-02～2025-02-03）：
 
    ```bash
@@ -345,7 +345,19 @@ system_test_project/
 #### 步骤（ST-05）
 
 1. 初始使用 `orders_full_4_evolution`
-2. 修改为 `INCREMENTAL_BY_TIME_RANGE`
+2. 修改为 `INCREMENTAL_BY_TIME_RANGE`, 并确保是 `primary key` 模型。
+
+   ```diff
+   -   kind FULL,
+   +   kind INCREMENTAL_BY_TIME_RANGE (
+   +       time_column ds
+   +   ),
+
+   +   physical_properties (
+   +   primary_key = (order_id, ds)
+   +)
+   ```
+
 3. 执行 `sqlmesh plan dev --start 2025-01-10 --end 2025-01-12 --restate-model starrocks_system_test.orders_full`（提示 apply 时输入 `y`，或使用 `--auto-apply`）
 
 #### 验证
@@ -385,8 +397,8 @@ system_test_project/
    +     COUNT(DISTINCT order_id) AS distinct_orders,
    +     SUM(amount) AS gross_amount,
    +     SUM(amount_double) AS gross_amount_double
-   FROM @orders_incremental
-   GROUP BY ds, user_id;
+   FROM starrocks_system_test.orders_incremental
+   GROUP BY ds, user_id, region;
    ```
 
 2. 执行 `sqlmesh plan dev --start 2025-01-13 --end 2025-01-13 --restate-model starrocks_system_test.orders_summary_mv`
@@ -405,7 +417,7 @@ system_test_project/
 
 #### 变更内容（ST-07）
 
-* 在 orders_full.sql 新增 nullable 列，并在 SELECT 中赋值：
+* 在 `orders_full.sql` 新增 nullable 列，并在 SELECT 中赋值：
 
    ```diff
      columns (
@@ -414,8 +426,8 @@ system_test_project/
          region VARCHAR(20),
          amount DECIMAL(10, 2),
          ts BIGINT,
-         ds DATE,
-   +     comment VARCHAR(100)
+         ds DATE
+   +     , comment VARCHAR(100)
      )
 
      SELECT
@@ -424,8 +436,8 @@ system_test_project/
          region,
          amount,
          ts,
-         ds,
-   +     NULL AS comment
+         ds
+   +     , NULL AS comment
      FROM starrocks_system_test.raw_orders;
    ```
 
@@ -443,7 +455,18 @@ system_test_project/
 
 #### 变更内容（ST-08）
 
-* 修改 `orders_view` SQL
+* 修改 `orders_view` SQL, 比如修改一列：
+
+   ```diff
+    SELECT
+      order_id,
+      user_id,
+      region,
+      amount,
+   -  ts,
+   +  ts - 3600 as ts,
+      ds,
+   ```
 
 #### 验证（ST-08）
 
