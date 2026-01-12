@@ -1971,26 +1971,26 @@ def test_starrocks(make_config):
     assert config.database == "testdb"
     assert config.DIALECT == "starrocks"
     assert config.DISPLAY_NAME == "StarRocks"
-    assert config.DISPLAY_ORDER == 18
+    assert config.DISPLAY_ORDER == 19
     assert config.is_recommended_for_state_sync is False
 
     # Test with minimal configuration (using default port)
     minimal_config = make_config(
         type="starrocks",
-        host="starrocks_fe",
+        host="starrocks-fe",
         user="starrocks_user",
         password="starrocks_pswd",
         check_import=False,
     )
     assert isinstance(minimal_config, StarRocksConnectionConfig)
     assert minimal_config.port == 9030  # Default StarRocks FE port
-    assert minimal_config.host == "starrocks_fe"
+    assert minimal_config.host == "starrocks-fe"
     assert minimal_config.user == "starrocks_user"
 
     # Test with additional MySQL-compatible options
     advanced_config = make_config(
         type="starrocks",
-        host="starrocks_fe",
+        host="starrocks-fe",
         user="admin",
         password="admin123",
         port=9030,
