@@ -1,0 +1,14 @@
+gateways:
+  local:
+    connection:
+      type: mysql
+      host: 127.0.0.1
+      port: 9030
+      user: "myname"
+      password: "pswd1234"
+      database: "test"
+
+default_gateway: local
+
+model_defaults:
+  dialect: mysql

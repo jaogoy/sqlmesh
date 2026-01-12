@@ -1,0 +1,23 @@
+project: starrocks_system_test
+
+default_gateway: starrocks_dev
+
+gateways:
+  starrocks_dev:
+    connection:
+      type: starrocks
+      host: localhost
+      port: 9030
+      user: myname
+      password: pswd1234
+      database: starrocks_system_test
+    state_connection:
+      type: duckdb
+      database: ./state/system_test_state.db
+
+model_defaults:
+  dialect: starrocks
+  start: 2025-01-01
+  cron: '@daily'
+  owner: system_test_owner
+

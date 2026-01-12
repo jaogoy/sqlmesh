@@ -1,0 +1,14 @@
+gateways:
+  local:
+    connection:
+      type: starrocks
+      host: localhost
+      port: 9030
+      user: root
+      password: ""
+      database: mytest
+
+default_gateway: local
+
+model_defaults:
+  dialect: starrocks
