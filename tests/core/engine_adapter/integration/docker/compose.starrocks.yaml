@@ -3,11 +3,11 @@ services:
     image: starrocks/fe-ubuntu:3.5-latest
     container_name: starrocks-fe
     hostname: starrocks-fe
+    environment:
+      - FE_SERVERS=fe1:starrocks-fe:9030
     ports:
       - "9030:9030"  # MySQL protocol port for tests
       - "8030:8030"  # HTTP port
-    environment:
-      - FE_SERVERS=fe1:starrocks-fe:9010
     networks:
       - starrocks_net
 
@@ -18,7 +18,7 @@ services:
     depends_on:
       - starrocks-fe
     environment:
-      - FE_SERVERS=starrocks-fe:9010
+      - FE_SERVERS=starrocks-fe:9030
     networks:
       - starrocks_net
 
