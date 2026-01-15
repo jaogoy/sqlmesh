@@ -8,8 +8,8 @@ gateways:
       type: starrocks
       host: localhost
       port: 9030
-      user: myname
-      password: pswd1234
+      user: root
+      password: ""
       database: starrocks_system_test
     state_connection:
       type: duckdb
